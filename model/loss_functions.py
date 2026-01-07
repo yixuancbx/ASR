@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class AMSoftmaxLoss(nn.Module):
@@ -50,6 +51,40 @@ class AMSoftmaxLoss(nn.Module):
         # 计算交叉熵损失
         loss = F.cross_entropy(output, labels)
         
+        return loss
+
+
+class AAMSoftmaxLoss(nn.Module):
+    """
+    Additive Angular Margin Softmax (ArcFace)
+    相比 AM-Softmax 在角度空间上施加 margin，通常收敛更稳定、性能更好
+    """
+    def __init__(self, embedding_dim, num_classes, margin=0.2, scale=30.0, eps=1e-7):
+        super(AAMSoftmaxLoss, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.num_classes = num_classes
+        self.margin = margin
+        self.scale = scale
+        self.eps = eps
+
+        self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, embeddings, labels):
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        weight = F.normalize(self.weight, p=2, dim=1)
+
+        cosine = F.linear(embeddings, weight)  # [B, num_classes]
+        cosine = cosine.clamp(-1 + self.eps, 1 - self.eps)
+
+        theta = torch.acos(cosine)
+        target_logits = torch.cos(theta + self.margin)
+
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, labels.unsqueeze(1), 1.0)
+
+        output = self.scale * (one_hot * target_logits + (1.0 - one_hot) * cosine)
+        loss = F.cross_entropy(output, labels)
         return loss
 
 
@@ -130,7 +165,8 @@ class MixedLossFunction(nn.Module):
                  intra_margin=0.5, 
                  lambda_intra=0.1):
         super(MixedLossFunction, self).__init__()
-        self.am_loss = AMSoftmaxLoss(embedding_dim, num_classes, am_margin, am_scale)
+        # 使用 AAM-Softmax 作为主分类损失
+        self.am_loss = AAMSoftmaxLoss(embedding_dim, num_classes, margin=am_margin, scale=am_scale)
         self.intra_loss = IntraClassAggregationLoss(intra_margin)
         self.lambda_intra = lambda_intra
         

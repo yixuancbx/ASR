@@ -49,7 +49,7 @@ class Trainer:
                 print("已启用 torch.compile 以加速训练/推理")
             except Exception as e:
                 print(f"torch.compile 启用失败，继续使用原模型: {e}")
-        
+
         # 创建损失函数并移动到设备
         self.criterion = MixedLossFunction(
             embedding_dim=config['embedding_dim'],
@@ -60,9 +60,9 @@ class Trainer:
             lambda_intra=config['lambda_intra']
         ).to(self.device)
         
-        # 创建优化器
+        # 创建优化器（包含模型参数 + 损失函数参数，例如 AAM-Softmax 的可学习权重）
         self.optimizer = optim.Adam(
-            self.model.parameters(),
+            list(self.model.parameters()) + list(self.criterion.parameters()),
             lr=config['learning_rate'],
             weight_decay=config['weight_decay']
         )
@@ -95,6 +95,24 @@ class Trainer:
             'am_loss': [],
             'intra_loss': []
         }
+
+    def _load_state_dict_flexible(self, state_dict):
+        """
+        为了兼容架构升级（例如池化维度变化），对shape不匹配的参数跳过加载。
+        返回：missing, unexpected, skipped
+        """
+        current = self.model.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k in current and current[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                skipped.append(k)
+        missing, unexpected = self.model.load_state_dict(filtered, strict=False)
+        if skipped:
+            print(f"跳过因shape不匹配的参数: {skipped}")
+        return missing, unexpected, skipped
         
     def train_epoch(self, dataloader):
         """训练一个epoch，支持梯度累积"""
@@ -295,7 +313,16 @@ class Trainer:
             checkpoint = torch.load(resume_from, map_location=self.device)
             start_epoch = checkpoint['epoch'] + 1
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+
+            # 兼容shape变化的加载
+            missing, unexpected, skipped = self._load_state_dict_flexible(checkpoint['model_state_dict'])
+            if missing:
+                print(f"加载检查点: 缺少参数 {missing}")
+            if unexpected:
+                print(f"加载检查点: 多余参数 {unexpected}")
+            if skipped:
+                print(f"加载检查点: 跳过shape不匹配参数 {skipped}")
+
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.train_history = checkpoint.get('train_history', {'loss': [], 'am_loss': [], 'intra_loss': []})
@@ -394,7 +421,16 @@ class Trainer:
             best_val_loss: 最佳验证损失
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # 允许因架构升级（例如统计池化由 C->2C）导致的 shape 变化
+        missing, unexpected, skipped = self._load_state_dict_flexible(checkpoint['model_state_dict'])
+        if missing:
+            print(f"加载检查点: 缺少参数 {missing}")
+        if unexpected:
+            print(f"加载检查点: 多余参数 {unexpected}")
+        if skipped:
+            print(f"加载检查点: 跳过shape不匹配参数 {skipped}")
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.train_history = checkpoint.get('train_history', {'loss': [], 'am_loss': [], 'intra_loss': []})

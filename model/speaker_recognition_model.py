@@ -58,12 +58,12 @@ class SpeakerRecognitionModel(nn.Module):
             nn.ReLU(),
         )
         
-        # 5. 全局池化（在嵌入映射前）
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        # 5. 统计池化（ASP/SAP简化版）：拼接均值和标准差
+        self.stats_dim = attention_channels * 2
         
         # 6. 嵌入向量映射层（全连接层）
         self.embedding_layers = nn.Sequential(
-            nn.Linear(attention_channels, embedding_dim),
+            nn.Linear(self.stats_dim, embedding_dim),
             nn.BatchNorm1d(embedding_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -93,9 +93,10 @@ class SpeakerRecognitionModel(nn.Module):
         # 4. 特征拼接与融合
         fused_features = self.feature_fusion(attended_features)  # [B, 3*C, T]
         
-        # 5. 全局池化
-        pooled_features = self.global_pool(fused_features)  # [B, 3*C, 1]
-        pooled_features = pooled_features.squeeze(-1)  # [B, 3*C]
+        # 5. 统计池化（均值+标准差）
+        mean = fused_features.mean(dim=2)
+        std = fused_features.std(dim=2)
+        pooled_features = torch.cat([mean, std], dim=1)  # [B, 2*3*C]
         
         # 6. 嵌入向量映射
         # 处理batch_size=1的情况（BatchNorm需要至少2个样本）
