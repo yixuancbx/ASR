@@ -57,26 +57,42 @@ def main():
             }
         }
     
-    # 合并配置
-    config = {
-        'in_channels': config_dict['model']['in_channels'],
-        'frontend_channels': config_dict['model']['frontend_channels'],
-        'attention_channels': config_dict['model']['attention_channels'],
-        'embedding_dim': config_dict['model']['embedding_dim'],
-        'num_classes': config_dict['model']['num_classes'],
-        'num_heads': config_dict['model']['num_heads'],
-        'dropout': config_dict['model']['dropout'],
-        'am_margin': config_dict['loss']['am_margin'],
-        'am_scale': config_dict['loss']['am_scale'],
-        'intra_margin': config_dict['loss']['intra_margin'],
-        'lambda_intra': config_dict['loss']['lambda_intra'],
-        'learning_rate': config_dict['training']['learning_rate'],
-        'weight_decay': config_dict['training']['weight_decay'],
-        'lr_step_size': config_dict['training']['lr_step_size'],
-        'lr_gamma': config_dict['training']['lr_gamma'],
-        'checkpoint_dir': config_dict['training']['checkpoint_dir'],
-        'num_epochs': config_dict['training']['num_epochs']
+    # 合并配置：优先使用 config.json 的全部字段，缺失时再补默认值
+    config = {}
+    for section in ['model', 'loss', 'training']:
+        config.update(config_dict.get(section, {}))
+    # 补充默认值（仅当缺失时）
+    defaults = {
+        'in_channels': 1,
+        'frontend_channels': 64,
+        'attention_channels': 192,
+        'embedding_dim': 256,
+        'num_classes': 100,
+        'num_heads': 8,
+        'dropout': 0.1,
+        'am_margin': 0.3,
+        'am_scale': 30.0,
+        'intra_margin': 0.5,
+        'lambda_intra': 0.1,
+        'learning_rate': 0.001,
+        'weight_decay': 1e-5,
+        'lr_step_size': 20,
+        'lr_gamma': 0.5,
+        'checkpoint_dir': 'checkpoints',
+        'num_epochs': 100,
+        # 新增：训练与调度相关的可选项，保证从 config.json 读取时不丢失
+        'scheduler': 'cosine',
+        'cosine_T0': 10,
+        'cosine_Tmult': 2,
+        'compile': False,
+        'use_amp': True,
+        'accumulation_steps': 1,
+        'max_train_batches': None,
+        'max_val_batches': None,
+        'save_interval': 10,
     }
+    for k, v in defaults.items():
+        config.setdefault(k, v)
     
     # 创建数据加载器
     print("\n创建数据加载器...")
