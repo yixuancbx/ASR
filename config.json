@@ -40,7 +40,7 @@
     "num_workers": 6,
     "augmentation": true,
     "train_split": 0.9,
-    "data_root": "D:/VPN/vox1_dev_wav/wav",
+    "data_root": "D:/BaiduNetdiskDownload/mvlrs_v1",
     "train_list": "train_list.txt",
     "val_list": "val_list.txt"
   }

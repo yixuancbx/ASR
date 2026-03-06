@@ -6,7 +6,7 @@ import json
 import os
 import gc
 from model import SpeakerRecognitionModel
-from train import Trainer, create_dummy_dataset, create_voxceleb_dataset, create_voxceleb_dataset_from_list
+from train import Trainer, create_dummy_dataset, create_lrs_dataset_from_list
 
 # 清理GPU缓存（在导入后立即执行）
 if torch.cuda.is_available():
@@ -97,7 +97,7 @@ def main():
     # 创建数据加载器
     print("\n创建数据加载器...")
     
-    # 检查是否指定了VoxCeleb数据集路径
+    # 检查是否指定了LRS数据集路径
     data_config = config_dict.get('data', {})
     data_root = data_config.get('data_root', None)
     train_list = data_config.get('train_list', None)
@@ -108,7 +108,7 @@ def main():
         print(f"从列表文件加载数据集...")
         print(f"  训练集列表: {train_list}")
         print(f"  验证集列表: {val_list}")
-        train_loader, val_loader, num_classes = create_voxceleb_dataset_from_list(
+        train_loader, val_loader, num_classes = create_lrs_dataset_from_list(
             train_list=train_list,
             val_list=val_list,
             data_root=data_root,
@@ -122,26 +122,10 @@ def main():
         config['num_classes'] = num_classes
         config_dict['model']['num_classes'] = num_classes
         print(f"检测到 {num_classes} 个说话人")
-    elif data_root and os.path.exists(data_root):
-        # 使用目录方式
-        print(f"从目录加载数据集: {data_root}")
-        train_loader, val_loader, num_classes = create_voxceleb_dataset(
-            data_root=data_root,
-            batch_size=config_dict['training']['batch_size'],
-            sample_rate=data_config.get('sample_rate', 16000),
-            segment_length=data_config.get('seq_length', 16000),
-            train_split=data_config.get('train_split', 0.9),
-            augmentation=data_config.get('augmentation', True),
-            num_workers=data_config.get('num_workers', 4)
-        )
-        # 更新配置中的说话人数量
-        config['num_classes'] = num_classes
-        config_dict['model']['num_classes'] = num_classes
-        print(f"检测到 {num_classes} 个说话人")
     else:
         # 使用虚拟数据（用于测试）
-        print("未找到VoxCeleb数据集路径，使用虚拟数据进行测试")
-        print("提示：在config.json中设置data_root或train_list/val_list以使用真实数据集")
+        print("未找到LRS数据集路径，使用虚拟数据进行测试")
+        print("提示：在config.json中设置train_list和val_list以使用真实LRS数据集")
         train_loader, val_loader, _ = create_dummy_dataset(
             batch_size=config_dict['training']['batch_size'],
             num_samples=1000,

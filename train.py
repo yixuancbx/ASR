@@ -562,86 +562,117 @@ def create_voxceleb_dataset(data_root,
     return train_loader, val_loader, num_classes
 
 
-def create_voxceleb_dataset_from_list(train_list,
-                                     val_list,
-                                     data_root=None,
-                                     batch_size=32,
-                                     sample_rate=16000,
-                                     segment_length=16000,
-                                     augmentation=True,
-                                     num_workers=4):
-    """
-    从列表文件创建VoxCeleb数据集加载器
-    
-    Args:
-        train_list: 训练集列表文件路径
-        val_list: 验证集列表文件路径
-        data_root: 数据集根目录（如果列表中是相对路径）
-        batch_size: 批次大小
-        sample_rate: 采样率
-        segment_length: 音频片段长度
-        augmentation: 是否使用数据增强
-        num_workers: 数据加载器工作线程数
-    Returns:
-        train_loader: 训练数据加载器
-        val_loader: 验证数据加载器
-        num_classes: 说话人数量
-    """
-    from dataset import VoxCelebDatasetFromList
-    
-    # 创建训练集
-    train_dataset = VoxCelebDatasetFromList(
-        list_file=train_list,
-        data_root=data_root,
-        sample_rate=sample_rate,
-        segment_length=segment_length,
-        train=True,
-        augmentation=augmentation
+# def create_voxceleb_dataset_from_list(train_list,
+#                                      val_list,
+#                                      data_root=None,
+#                                      batch_size=32,
+#                                      sample_rate=16000,
+#                                      segment_length=16000,
+#                                      augmentation=True,
+#                                      num_workers=4):
+#     """
+#     从列表文件创建VoxCeleb数据集加载器
+#
+#     Args:
+#         train_list: 训练集列表文件路径
+#         val_list: 验证集列表文件路径
+#         data_root: 数据集根目录（如果列表中是相对路径）
+#         batch_size: 批次大小
+#         sample_rate: 采样率
+#         segment_length: 音频片段长度
+#         augmentation: 是否使用数据增强
+#         num_workers: 数据加载器工作线程数
+#     Returns:
+#         train_loader: 训练数据加载器
+#         val_loader: 验证数据加载器
+#         num_classes: 说话人数量
+#     """
+#     from dataset import VoxCelebDatasetFromList
+#
+#     # 创建训练集
+#     train_dataset = VoxCelebDatasetFromList(
+#         list_file=train_list,
+#         data_root=data_root,
+#         sample_rate=sample_rate,
+#         segment_length=segment_length,
+#         train=True,
+#         augmentation=augmentation
+#     )
+#
+#     # 创建验证集（需要共享说话人映射）
+#     val_dataset = VoxCelebDatasetFromList(
+#         list_file=val_list,
+#         data_root=data_root,
+#         sample_rate=sample_rate,
+#         segment_length=segment_length,
+#         train=False,
+#         augmentation=False
+#     )
+#
+#     # 获取说话人数量（使用训练集的说话人数量）
+#     num_classes = train_dataset.get_num_speakers()
+#
+#     # 如果使用GPU则开启pin_memory以提升主机到GPU的数据传输吞吐
+#     use_pin_memory = torch.cuda.is_available()
+#     enable_persistent = num_workers > 0
+#     prefetch = 2 if num_workers > 0 else None
+#
+#     # 创建数据加载器
+#     train_loader = DataLoader(
+#         train_dataset,
+#         batch_size=batch_size,
+#         shuffle=True,
+#         num_workers=num_workers,
+#         pin_memory=use_pin_memory,
+#         persistent_workers=enable_persistent,  # 保持worker常驻，减少启动开销
+#         prefetch_factor=prefetch,  # 适度预取
+#         drop_last=True  # 丢弃最后一个不完整的batch，避免batch_size=1的问题
+#     )
+#
+#     val_loader = DataLoader(
+#         val_dataset,
+#         batch_size=batch_size,
+#         shuffle=False,
+#         num_workers=num_workers,
+#         pin_memory=use_pin_memory,
+#         persistent_workers=enable_persistent,
+#         prefetch_factor=prefetch,
+#         drop_last=False  # 验证时可以保留最后一个batch
+#     )
+#
+#     return train_loader, val_loader, num_classes
+
+
+def create_lrs_dataset_from_list(train_list, val_list, data_root=None,
+                                 batch_size=32, sample_rate=16000,
+                                 segment_length=16000, augmentation=True, num_workers=4):
+    from dataset.lrs_dataset import LRSDatasetFromList
+
+    train_dataset = LRSDatasetFromList(
+        list_file=train_list, data_root=data_root, sample_rate=sample_rate,
+        segment_length=segment_length, train=True, augmentation=augmentation
     )
-    
-    # 创建验证集（需要共享说话人映射）
-    val_dataset = VoxCelebDatasetFromList(
-        list_file=val_list,
-        data_root=data_root,
-        sample_rate=sample_rate,
-        segment_length=segment_length,
-        train=False,
-        augmentation=False
+    val_dataset = LRSDatasetFromList(
+        list_file=val_list, data_root=data_root, sample_rate=sample_rate,
+        segment_length=segment_length, train=False, augmentation=False
     )
-    
-    # 获取说话人数量（使用训练集的说话人数量）
+
     num_classes = train_dataset.get_num_speakers()
-    
-    # 如果使用GPU则开启pin_memory以提升主机到GPU的数据传输吞吐
     use_pin_memory = torch.cuda.is_available()
     enable_persistent = num_workers > 0
     prefetch = 2 if num_workers > 0 else None
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,  # 保持worker常驻，减少启动开销
-        prefetch_factor=prefetch,  # 适度预取
-        drop_last=True  # 丢弃最后一个不完整的batch，避免batch_size=1的问题
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
-        drop_last=False  # 验证时可以保留最后一个batch
-    )
-    
-    return train_loader, val_loader, num_classes
 
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=use_pin_memory, persistent_workers=enable_persistent,
+        prefetch_factor=prefetch, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=use_pin_memory, persistent_workers=enable_persistent,
+        prefetch_factor=prefetch, drop_last=False
+    )
+    return train_loader, val_loader, num_classes
 
 if __name__ == '__main__':
     # 配置参数
