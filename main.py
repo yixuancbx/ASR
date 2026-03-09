@@ -6,13 +6,40 @@ import json
 import os
 import gc
 from model import SpeakerRecognitionModel
-from train import Trainer, create_dummy_dataset, create_lrs_dataset_from_list
+from train import (
+    Trainer,
+    create_dummy_dataset,
+    create_lrs_dataset_from_list,
+    create_voxceleb_dataset,
+    create_voxceleb_dataset_from_list,
+    create_vox2video_dataset_from_list,
+)
 
 # 清理GPU缓存（在导入后立即执行）
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     gc.collect()
+
+
+def infer_dataset_type(train_list):
+    """根据列表文件内容推断数据集类型"""
+    try:
+        with open(train_list, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                file_path = line.split()[0].lower()
+                if file_path.endswith('.wav'):
+                    return 'voxceleb'
+                if file_path.endswith(('.mp4', '.avi', '.mov')):
+                    if 'vox' in file_path:
+                        return 'vox2video'
+                    return 'lrs'
+    except OSError:
+        pass
+    return None
 
 
 def main():
@@ -90,6 +117,9 @@ def main():
         'max_train_batches': None,
         'max_val_batches': None,
         'save_interval': 10,
+        'use_video': False,
+        'video_in_channels': 3,
+        'video_channels': 32,
     }
     for k, v in defaults.items():
         config.setdefault(k, v)
@@ -102,30 +132,65 @@ def main():
     data_root = data_config.get('data_root', None)
     train_list = data_config.get('train_list', None)
     val_list = data_config.get('val_list', None)
+    dataset_type = data_config.get('dataset_type')
     
     if train_list and val_list:
-        # 使用列表文件方式
+        dataset_type = dataset_type or infer_dataset_type(train_list)
+
+        if dataset_type == 'voxceleb':
+            dataset_loader = create_voxceleb_dataset_from_list
+            dataset_name = 'VoxCeleb'
+        elif dataset_type == 'vox2video':
+            dataset_loader = create_vox2video_dataset_from_list
+            dataset_name = 'Vox2Video'
+        elif dataset_type == 'lrs':
+            dataset_loader = create_lrs_dataset_from_list
+            dataset_name = 'LRS'
+        else:
+            raise ValueError('无法根据列表文件推断数据集类型，请在config.json中设置 data.dataset_type')
+
         print(f"从列表文件加载数据集...")
+        print(f"  数据集类型: {dataset_name}")
         print(f"  训练集列表: {train_list}")
         print(f"  验证集列表: {val_list}")
-        train_loader, val_loader, num_classes = create_lrs_dataset_from_list(
-            train_list=train_list,
-            val_list=val_list,
+        loader_kwargs = {
+            'train_list': train_list,
+            'val_list': val_list,
+            'data_root': data_root,
+            'batch_size': config_dict['training']['batch_size'],
+            'sample_rate': data_config.get('sample_rate', 16000),
+            'segment_length': data_config.get('seq_length', 16000),
+            'augmentation': data_config.get('augmentation', True),
+            'num_workers': data_config.get('num_workers', 4),
+        }
+        if dataset_type == 'vox2video':
+            loader_kwargs['num_frames'] = data_config.get('video_num_frames', 8)
+            loader_kwargs['frame_size'] = data_config.get('video_frame_size', 112)
+
+        train_loader, val_loader, num_classes = dataset_loader(**loader_kwargs)
+        # 更新配置中的说话人数量
+        config['num_classes'] = num_classes
+        config['use_video'] = (dataset_type == 'vox2video')
+        config_dict['model']['num_classes'] = num_classes
+        print(f"检测到 {num_classes} 个说话人")
+    elif data_root and dataset_type == 'voxceleb':
+        print("从VoxCeleb目录直接扫描并划分数据集...")
+        train_loader, val_loader, num_classes = create_voxceleb_dataset(
             data_root=data_root,
             batch_size=config_dict['training']['batch_size'],
             sample_rate=data_config.get('sample_rate', 16000),
             segment_length=data_config.get('seq_length', 16000),
+            train_split=data_config.get('train_split', 0.8),
             augmentation=data_config.get('augmentation', True),
             num_workers=data_config.get('num_workers', 4)
         )
-        # 更新配置中的说话人数量
         config['num_classes'] = num_classes
         config_dict['model']['num_classes'] = num_classes
         print(f"检测到 {num_classes} 个说话人")
     else:
         # 使用虚拟数据（用于测试）
-        print("未找到LRS数据集路径，使用虚拟数据进行测试")
-        print("提示：在config.json中设置train_list和val_list以使用真实LRS数据集")
+        print("未找到可用的数据集配置，使用虚拟数据进行测试")
+        print("提示：在config.json中设置 train_list/val_list 或 VoxCeleb 的 data_root")
         train_loader, val_loader, _ = create_dummy_dataset(
             batch_size=config_dict['training']['batch_size'],
             num_samples=1000,

@@ -24,8 +24,13 @@ class SpeakerRecognitionModel(nn.Module):
                  embedding_dim=256,
                  num_classes=100,
                  num_heads=8,
-                 dropout=0.1):
+                 dropout=0.1,
+                 use_video=False,
+                 video_in_channels=3,
+                 video_channels=32):
         super(SpeakerRecognitionModel, self).__init__()
+        self.use_video = use_video
+        self.embedding_dim = embedding_dim
         
         # 1. 多尺度特征提取前端
         self.multi_scale_frontend = MultiScaleFeatureExtraction(
@@ -70,17 +75,59 @@ class SpeakerRecognitionModel(nn.Module):
             nn.Linear(embedding_dim, embedding_dim),
             nn.BatchNorm1d(embedding_dim),
         )
+
+        if self.use_video:
+            self.video_encoder = nn.Sequential(
+                nn.Conv3d(video_in_channels, video_channels, kernel_size=(3, 5, 5), padding=(1, 2, 2)),
+                nn.BatchNorm3d(video_channels),
+                nn.ReLU(),
+                nn.MaxPool3d(kernel_size=(1, 2, 2)),
+                nn.Conv3d(video_channels, video_channels * 2, kernel_size=3, padding=1),
+                nn.BatchNorm3d(video_channels * 2),
+                nn.ReLU(),
+                nn.MaxPool3d(kernel_size=(2, 2, 2)),
+                nn.Conv3d(video_channels * 2, video_channels * 4, kernel_size=3, padding=1),
+                nn.BatchNorm3d(video_channels * 4),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool3d((1, 1, 1)),
+            )
+            self.video_projection = nn.Sequential(
+                nn.Linear(video_channels * 4, embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.modal_fusion = nn.Sequential(
+                nn.Linear(embedding_dim * 2, embedding_dim),
+                nn.BatchNorm1d(embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.BatchNorm1d(embedding_dim),
+            )
         
-    def forward(self, x, return_embedding=True):
+    def _apply_embedding_layers(self, pooled_features):
+        batch_size = pooled_features.size(0)
+        if batch_size == 1 and self.training:
+            was_training = self.training
+            self.eval()
+            with torch.no_grad():
+                embedding = self.embedding_layers(pooled_features)
+            if was_training:
+                self.train()
+            return embedding
+        return self.embedding_layers(pooled_features)
+
+    def encode_audio(self, x):
         """
+        提取音频说话人嵌入
+
         Args:
             x: [B, 1, T] 输入短语音波形
-            return_embedding: 是否返回嵌入向量（True）或分类logits（False）
         Returns:
-            embedding: [B, embedding_dim] 判别性说话人嵌入向量
-            或
-            logits: [B, num_classes] 分类logits（如果return_embedding=False）
+            [B, embedding_dim] 判别性说话人嵌入向量
         """
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
         # 1. 多尺度特征提取
         features = self.multi_scale_frontend(x)  # [B, 3*C, T]
         
@@ -97,29 +144,30 @@ class SpeakerRecognitionModel(nn.Module):
         mean = fused_features.mean(dim=2)
         std = fused_features.std(dim=2)
         pooled_features = torch.cat([mean, std], dim=1)  # [B, 2*3*C]
-        
-        # 6. 嵌入向量映射
-        # 处理batch_size=1的情况（BatchNorm需要至少2个样本）
-        batch_size = pooled_features.size(0)
-        if batch_size == 1 and self.training:
-            # 在训练模式下，如果batch_size=1，临时切换到eval模式
-            was_training = self.training
-            self.eval()
-            with torch.no_grad():
-                embedding = self.embedding_layers(pooled_features)  # [B, embedding_dim]
-            # 恢复训练模式
-            if was_training:
-                self.train()
+        embedding = self._apply_embedding_layers(pooled_features)
+        return F.normalize(embedding, p=2, dim=1)
+
+    def encode_video(self, video):
+        """提取视频说话人嵌入，输入 [B, F, C, H, W]"""
+        if video.dim() != 5:
+            raise ValueError("视频输入应为 [B, F, C, H, W]")
+
+        video = video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+        features = self.video_encoder(video).flatten(1)
+        embedding = self.video_projection(features)
+        return F.normalize(embedding, p=2, dim=1)
+
+    def forward(self, x, video=None, return_embedding=True):
+        audio_embedding = self.encode_audio(x)
+
+        if self.use_video and video is not None:
+            video_embedding = self.encode_video(video)
+            fused_embedding = self.modal_fusion(torch.cat([audio_embedding, video_embedding], dim=1))
+            fused_embedding = F.normalize(fused_embedding, p=2, dim=1)
         else:
-            embedding = self.embedding_layers(pooled_features)  # [B, embedding_dim]
-        
-        # 归一化嵌入向量（用于余弦相似度计算）
-        embedding = F.normalize(embedding, p=2, dim=1)
-        
+            fused_embedding = audio_embedding
+
         if return_embedding:
-            return embedding
-        else:
-            # 如果需要分类logits，需要额外的分类层
-            # 这里返回嵌入向量，分类层在损失函数中实现
-            return embedding
+            return fused_embedding
+        return fused_embedding
 

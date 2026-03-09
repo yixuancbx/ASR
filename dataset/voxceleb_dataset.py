@@ -192,7 +192,9 @@ class VoxCelebDatasetFromList(Dataset):
                  sample_rate=16000,
                  segment_length=16000,
                  train=True,
-                 augmentation=False):
+                 augmentation=False,
+                 speaker_to_id=None,
+                 allow_new_speakers=True):
         """
         Args:
             list_file: 列表文件路径
@@ -201,17 +203,20 @@ class VoxCelebDatasetFromList(Dataset):
             segment_length: 音频片段长度
             train: 是否为训练集
             augmentation: 是否使用数据增强
+            speaker_to_id: 共享的说话人映射，用于保证训练/验证标签一致
+            allow_new_speakers: 是否允许在读取列表时新增说话人
         """
         self.data_root = data_root
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.train = train
         self.augmentation = augmentation
+        self.allow_new_speakers = allow_new_speakers
         
         # 加载文件列表
         self.audio_files = []
         self.speaker_ids = []
-        self.speaker_to_id = {}
+        self.speaker_to_id = dict(speaker_to_id) if speaker_to_id is not None else {}
         
         # 缓存重采样器（避免每次创建）
         self.resampler = None
@@ -224,6 +229,9 @@ class VoxCelebDatasetFromList(Dataset):
     
     def _load_list_file(self, list_file):
         """从列表文件加载数据"""
+        skipped_missing = 0
+        skipped_unknown_speaker = 0
+
         with open(list_file, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
@@ -236,6 +244,8 @@ class VoxCelebDatasetFromList(Dataset):
                 
                 audio_file = parts[0]
                 speaker_name = parts[1]
+
+                audio_file = os.path.normpath(audio_file)
                 
                 # 构建完整路径
                 if self.data_root and not os.path.isabs(audio_file):
@@ -243,6 +253,9 @@ class VoxCelebDatasetFromList(Dataset):
                 
                 # 分配说话人ID
                 if speaker_name not in self.speaker_to_id:
+                    if not self.allow_new_speakers:
+                        skipped_unknown_speaker += 1
+                        continue
                     self.speaker_to_id[speaker_name] = len(self.speaker_to_id)
                 
                 speaker_id = self.speaker_to_id[speaker_name]
@@ -250,6 +263,13 @@ class VoxCelebDatasetFromList(Dataset):
                 if os.path.exists(audio_file):
                     self.audio_files.append(audio_file)
                     self.speaker_ids.append(speaker_id)
+                else:
+                    skipped_missing += 1
+
+        if skipped_unknown_speaker > 0:
+            print(f"警告: 跳过 {skipped_unknown_speaker} 条未在训练集中出现的说话人样本")
+        if skipped_missing > 0:
+            print(f"警告: 跳过 {skipped_missing} 条不存在的音频文件")
     
     def _load_audio(self, filepath):
         """加载音频文件"""
