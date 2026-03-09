@@ -7,7 +7,7 @@
     "num_classes": 100,
     "num_heads": 4,
     "dropout": 0.1,
-    "use_video": true,
+    "use_video": false,
     "video_in_channels": 3,
     "video_channels": 32
   },
@@ -46,7 +46,7 @@
     "train_split": 0.8,
     "video_num_frames": 8,
     "video_frame_size": 112,
-    "data_root": "D:\\VPN\\vox2_test_mp4\\mp4",
+    "data_root": "D:\\VPN\\wav",
     "train_list": "train_list.txt",
     "val_list": "val_list.txt"
   }
