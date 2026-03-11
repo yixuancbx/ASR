@@ -117,6 +117,10 @@ def main():
         'max_train_batches': None,
         'max_val_batches': None,
         'save_interval': 10,
+        'val_interval': 1,
+        'compute_eer': False,
+        'eer_max_samples': 2048,
+        'empty_cache_each_epoch': True,
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,
@@ -135,7 +139,10 @@ def main():
     dataset_type = data_config.get('dataset_type')
     
     if train_list and val_list:
-        dataset_type = dataset_type or infer_dataset_type(train_list)
+        inferred_dataset_type = infer_dataset_type(train_list)
+        if dataset_type and inferred_dataset_type and dataset_type != inferred_dataset_type:
+            print(f"警告: config.json 中的 dataset_type={dataset_type}，但列表文件看起来更像 {inferred_dataset_type}")
+        dataset_type = dataset_type or inferred_dataset_type
 
         if dataset_type == 'voxceleb':
             dataset_loader = create_voxceleb_dataset_from_list
@@ -162,6 +169,9 @@ def main():
             'segment_length': data_config.get('seq_length', 16000),
             'augmentation': data_config.get('augmentation', True),
             'num_workers': data_config.get('num_workers', 4),
+            'pin_memory': data_config.get('pin_memory', None),
+            'persistent_workers': data_config.get('persistent_workers', False),
+            'prefetch_factor': data_config.get('prefetch_factor', 1),
         }
         if dataset_type == 'vox2video':
             loader_kwargs['num_frames'] = data_config.get('video_num_frames', 8)
@@ -182,7 +192,10 @@ def main():
             segment_length=data_config.get('seq_length', 16000),
             train_split=data_config.get('train_split', 0.8),
             augmentation=data_config.get('augmentation', True),
-            num_workers=data_config.get('num_workers', 4)
+            num_workers=data_config.get('num_workers', 4),
+            pin_memory=data_config.get('pin_memory', None),
+            persistent_workers=data_config.get('persistent_workers', False),
+            prefetch_factor=data_config.get('prefetch_factor', 1)
         )
         config['num_classes'] = num_classes
         config_dict['model']['num_classes'] = num_classes

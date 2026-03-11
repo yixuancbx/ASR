@@ -20,6 +20,38 @@ from model.loss_functions import MixedLossFunction
 torch.backends.cudnn.benchmark = True
 
 
+def _create_dataloader(dataset,
+                       batch_size,
+                       shuffle,
+                       num_workers,
+                       drop_last,
+                       pin_memory=None,
+                       persistent_workers=False,
+                       prefetch_factor=1):
+    """
+    统一创建 DataLoader。
+    默认使用更保守的 worker/prefetch 配置，降低长时间训练时的内存上涨风险。
+    """
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+
+    loader_kwargs = {
+        'dataset': dataset,
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'drop_last': drop_last,
+    }
+
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs['prefetch_factor'] = prefetch_factor
+
+    return DataLoader(**loader_kwargs)
+
+
 class Trainer:
     def __init__(self, config):
         self.config = config
@@ -91,6 +123,10 @@ class Trainer:
         self.scaler = GradScaler() if self.use_amp else None
         if self.use_amp:
             print("启用混合精度训练 (AMP) - 可提升训练速度约1.5-2倍")
+
+        self.compute_eer_enabled = config.get('compute_eer', False)
+        self.eer_max_samples = config.get('eer_max_samples', 2048)
+        self.empty_cache_each_epoch = config.get('empty_cache_each_epoch', True)
         
         # 训练历史
         self.train_history = {
@@ -131,6 +167,11 @@ class Trainer:
         audio = audio.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
         return audio, None, labels
+
+    def _maybe_release_memory(self):
+        gc.collect()
+        if torch.cuda.is_available() and self.empty_cache_each_epoch:
+            torch.cuda.empty_cache()
         
     def train_epoch(self, dataloader):
         """训练一个epoch，支持梯度累积"""
@@ -138,6 +179,7 @@ class Trainer:
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
+        processed_batches = 0
         accumulation_steps = max(1, self.config.get('accumulation_steps', 1))
         max_batches = self.config.get('max_train_batches', None)
         self.optimizer.zero_grad()
@@ -187,6 +229,7 @@ class Trainer:
             total_loss += loss_dict['total_loss']
             total_am_loss += loss_dict['am_loss']
             total_intra_loss += loss_dict['intra_loss']
+            processed_batches += 1
             
             # 更新进度条（减少更新频率以提升性能）
             if batch_idx % 10 == 0:
@@ -206,6 +249,10 @@ class Trainer:
             # 减少垃圾回收频率（从每50个batch改为每200个batch）
             if batch_idx % 200 == 0:
                 gc.collect()
+
+            del audio, labels, embeddings, loss, batch
+            if video is not None:
+                del video
         
         # 处理剩余未更新的梯度
         if pending_grad:
@@ -219,9 +266,12 @@ class Trainer:
                 self.optimizer.step()
             self.optimizer.zero_grad()
         
-        avg_loss = total_loss / len(dataloader)
-        avg_am_loss = total_am_loss / len(dataloader)
-        avg_intra_loss = total_intra_loss / len(dataloader)
+        if processed_batches == 0:
+            return 0.0, 0.0, 0.0
+
+        avg_loss = total_loss / processed_batches
+        avg_am_loss = total_am_loss / processed_batches
+        avg_intra_loss = total_intra_loss / processed_batches
         
         return avg_loss, avg_am_loss, avg_intra_loss
     
@@ -231,11 +281,13 @@ class Trainer:
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
+        processed_batches = 0
         max_batches = self.config.get('max_val_batches', None)
         all_embeddings = []
         all_labels = []
+        stored_samples = 0
         
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc='验证中', mininterval=1.0)):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
@@ -254,18 +306,31 @@ class Trainer:
                 total_loss += loss_dict['total_loss']
                 total_am_loss += loss_dict['am_loss']
                 total_intra_loss += loss_dict['intra_loss']
-                all_embeddings.append(embeddings.detach().cpu())
-                all_labels.append(labels.detach().cpu())
+                processed_batches += 1
+
+                if self.compute_eer_enabled and stored_samples < self.eer_max_samples:
+                    remaining = self.eer_max_samples - stored_samples
+                    all_embeddings.append(embeddings[:remaining].cpu())
+                    all_labels.append(labels[:remaining].cpu())
+                    stored_samples += min(remaining, embeddings.size(0))
                 
                 # 清理中间变量
-                del audio, labels, embeddings, loss
+                del audio, labels, embeddings, loss, batch
+                if video is not None:
+                    del video
                 if batch_idx % 50 == 0:
                     gc.collect()
         
-        avg_loss = total_loss / len(dataloader)
-        avg_am_loss = total_am_loss / len(dataloader)
-        avg_intra_loss = total_intra_loss / len(dataloader)
-        eer = self.compute_eer(all_embeddings, all_labels)
+        if processed_batches == 0:
+            return 0.0, 0.0, 0.0, None
+
+        avg_loss = total_loss / processed_batches
+        avg_am_loss = total_am_loss / processed_batches
+        avg_intra_loss = total_intra_loss / processed_batches
+        eer = self.compute_eer(all_embeddings, all_labels) if self.compute_eer_enabled else None
+
+        del all_embeddings, all_labels
+        self._maybe_release_memory()
         
         return avg_loss, avg_am_loss, avg_intra_loss, eer
 
@@ -348,6 +413,7 @@ class Trainer:
         
         # 获取保存间隔
         save_interval = self.config.get('save_interval', 10)
+        val_interval = max(1, self.config.get('val_interval', 1))
         
         for epoch in range(start_epoch, num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -364,18 +430,22 @@ class Trainer:
             print(f"训练损失: {train_loss:.4f} (AM: {train_am_loss:.4f}, Intra: {train_intra_loss:.4f})")
             
             # 验证
-            if val_loader is not None:
+            should_validate = val_loader is not None and ((epoch + 1) % val_interval == 0 or epoch == num_epochs - 1)
+            if should_validate:
                 val_loss, val_am_loss, val_intra_loss, val_eer = self.validate(val_loader)
                 if val_eer is not None:
                     print(f"验证损失: {val_loss:.4f} (AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {val_eer:.4f}")
                 else:
-                    print(f"验证损失: {val_loss:.4f} (AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: N/A（正负样本不足）")
+                    eer_msg = "未计算" if not self.compute_eer_enabled else "N/A（正负样本不足）"
+                    print(f"验证损失: {val_loss:.4f} (AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {eer_msg}")
                 
                 # 保存最佳模型
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     self.save_checkpoint(epoch, is_best=True, best_val_loss=best_val_loss)
                     print(f"保存最佳模型 (验证损失: {val_loss:.4f})")
+            elif val_loader is not None:
+                print(f"跳过本轮验证（val_interval={val_interval}）")
             
             # 定期保存检查点（每个save_interval epoch）
             if (epoch + 1) % save_interval == 0:
@@ -387,6 +457,8 @@ class Trainer:
             else:
                 self.scheduler.step()
             print(f"当前学习率: {self.scheduler.get_last_lr()[0]:.6f}")
+
+            self._maybe_release_memory()
         
         # 训练结束前保存最后一次checkpoint
         self.save_checkpoint(num_epochs - 1, is_best=False, best_val_loss=best_val_loss)
@@ -489,7 +561,10 @@ def create_voxceleb_dataset(data_root,
                             segment_length=16000,
                             train_split=0.9,
                             augmentation=True,
-                            num_workers=4):
+                            num_workers=4,
+                            pin_memory=None,
+                            persistent_workers=False,
+                            prefetch_factor=1):
     """
     创建VoxCeleb数据集加载器
     
@@ -546,33 +621,27 @@ def create_voxceleb_dataset(data_root,
         train_dataset = Subset(train_dataset_full, train_indices)
     
     # 如果使用GPU则开启pin_memory以提升主机到GPU的数据传输吞吐
-    use_pin_memory = torch.cuda.is_available()
-    # 对于多进程加载，持续worker可避免频繁重启带来的开销
-    enable_persistent = num_workers > 0
-    # 适度预取，提升吞吐
-    prefetch = 2 if num_workers > 0 else None
-    
     # 创建数据加载器
-    train_loader = DataLoader(
+    train_loader = _create_dataloader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
-        drop_last=True  # 丢弃最后一个不完整的batch，避免batch_size=1的问题
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        drop_last=True
     )
     
-    val_loader = DataLoader(
+    val_loader = _create_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
-        drop_last=False  # 验证时可以保留最后一个batch
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        drop_last=False
     )
     
     return train_loader, val_loader, num_classes
@@ -585,7 +654,10 @@ def create_voxceleb_dataset_from_list(train_list,
                                       sample_rate=16000,
                                       segment_length=16000,
                                       augmentation=True,
-                                      num_workers=4):
+                                      num_workers=4,
+                                      pin_memory=None,
+                                      persistent_workers=False,
+                                      prefetch_factor=1):
     """
     从列表文件创建VoxCeleb数据集加载器
 
@@ -626,29 +698,26 @@ def create_voxceleb_dataset_from_list(train_list,
     )
 
     num_classes = train_dataset.get_num_speakers()
-    use_pin_memory = torch.cuda.is_available()
-    enable_persistent = num_workers > 0
-    prefetch = 2 if num_workers > 0 else None
 
-    train_loader = DataLoader(
+    train_loader = _create_dataloader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         drop_last=True
     )
 
-    val_loader = DataLoader(
+    val_loader = _create_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         drop_last=False
     )
 
@@ -664,7 +733,10 @@ def create_vox2video_dataset_from_list(train_list,
                                        augmentation=True,
                                        num_workers=4,
                                        num_frames=8,
-                                       frame_size=112):
+                                       frame_size=112,
+                                       pin_memory=None,
+                                       persistent_workers=False,
+                                       prefetch_factor=1):
     """从 Vox2Video 的 mp4 列表创建音视频联合训练数据加载器"""
     from dataset import Vox2VideoDatasetFromList
 
@@ -693,29 +765,26 @@ def create_vox2video_dataset_from_list(train_list,
     )
 
     num_classes = train_dataset.get_num_speakers()
-    use_pin_memory = torch.cuda.is_available()
-    enable_persistent = num_workers > 0
-    prefetch = 2 if num_workers > 0 else None
 
-    train_loader = DataLoader(
+    train_loader = _create_dataloader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         drop_last=True
     )
 
-    val_loader = DataLoader(
+    val_loader = _create_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=use_pin_memory,
-        persistent_workers=enable_persistent,
-        prefetch_factor=prefetch,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         drop_last=False
     )
 
@@ -724,7 +793,8 @@ def create_vox2video_dataset_from_list(train_list,
 
 def create_lrs_dataset_from_list(train_list, val_list, data_root=None,
                                  batch_size=32, sample_rate=16000,
-                                 segment_length=16000, augmentation=True, num_workers=4):
+                                 segment_length=16000, augmentation=True, num_workers=4,
+                                 pin_memory=None, persistent_workers=False, prefetch_factor=1):
     from dataset.lrs_dataset import LRSDatasetFromList
 
     train_dataset = LRSDatasetFromList(
@@ -737,19 +807,26 @@ def create_lrs_dataset_from_list(train_list, val_list, data_root=None,
     )
 
     num_classes = train_dataset.get_num_speakers()
-    use_pin_memory = torch.cuda.is_available()
-    enable_persistent = num_workers > 0
-    prefetch = 2 if num_workers > 0 else None
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=use_pin_memory, persistent_workers=enable_persistent,
-        prefetch_factor=prefetch, drop_last=True
+    train_loader = _create_dataloader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        drop_last=True
     )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        pin_memory=use_pin_memory, persistent_workers=enable_persistent,
-        prefetch_factor=prefetch, drop_last=False
+    val_loader = _create_dataloader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        drop_last=False
     )
     return train_loader, val_loader, num_classes
 
