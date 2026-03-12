@@ -56,6 +56,9 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_grad_clip_norm = config.get('model_grad_clip_norm', 1.0)
+        self.criterion_grad_clip_norm = config.get('criterion_grad_clip_norm', 1.0)
+        self.skip_non_finite_batches = config.get('skip_non_finite_batches', True)
         
         # 清理GPU缓存
         if torch.cuda.is_available():
@@ -94,10 +97,14 @@ class Trainer:
             intra_margin=config['intra_margin'],
             lambda_intra=config['lambda_intra']
         ).to(self.device)
+
+        self.model_parameters = list(self.model.parameters())
+        self.criterion_parameters = list(self.criterion.parameters())
+        self.optim_parameters = self.model_parameters + self.criterion_parameters
         
         # 创建优化器（包含模型参数 + 损失函数参数，例如 AAM-Softmax 的可学习权重）
         self.optimizer = optim.Adam(
-            list(self.model.parameters()) + list(self.criterion.parameters()),
+            self.optim_parameters,
             lr=config['learning_rate'],
             weight_decay=config['weight_decay']
         )
@@ -172,6 +179,32 @@ class Trainer:
         gc.collect()
         if torch.cuda.is_available() and self.empty_cache_each_epoch:
             torch.cuda.empty_cache()
+
+    def _clip_gradients(self):
+        """分别裁剪模型与损失头的梯度，避免 ArcFace 分类头后期发散"""
+        model_grad_norm = None
+        criterion_grad_norm = None
+
+        if self.model_grad_clip_norm is not None and self.model_grad_clip_norm > 0:
+            model_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model_parameters,
+                max_norm=self.model_grad_clip_norm
+            )
+
+        if self.criterion_parameters and self.criterion_grad_clip_norm is not None and self.criterion_grad_clip_norm > 0:
+            criterion_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.criterion_parameters,
+                max_norm=self.criterion_grad_clip_norm
+            )
+
+        return model_grad_norm, criterion_grad_norm
+
+    def _is_finite_tensor(self, value):
+        if value is None:
+            return True
+        if isinstance(value, torch.Tensor):
+            return torch.isfinite(value).all().item()
+        return bool(value == value and value not in (float('inf'), float('-inf')))
         
     def train_epoch(self, dataloader):
         """训练一个epoch，支持梯度累积"""
@@ -199,29 +232,66 @@ class Trainer:
                 with autocast():
                     embeddings = self.model(audio, video=video)
                     loss, loss_dict = self.criterion(embeddings, labels)
+
+                if self.skip_non_finite_batches and not torch.isfinite(loss.detach()).all():
+                    print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    pending_grad = False
+                    del audio, labels, embeddings, loss, batch
+                    if video is not None:
+                        del video
+                    continue
+
                 loss = loss / accumulation_steps
                 self.scaler.scale(loss).backward()
                 # 每 accumulation_steps 次才更新参数
                 if (batch_idx + 1) % accumulation_steps == 0:
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.optimizer.zero_grad()
-                    pending_grad = False
+                    model_grad_norm, criterion_grad_norm = self._clip_gradients()
+                    if self.skip_non_finite_batches and (
+                        not self._is_finite_tensor(model_grad_norm) or
+                        not self._is_finite_tensor(criterion_grad_norm)
+                    ):
+                        print(f"警告: 第 {batch_idx} 个 batch 梯度出现非有限值，已跳过参数更新")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.scaler.update()
+                        pending_grad = False
+                    else:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pending_grad = False
                 else:
                     pending_grad = True
             else:
                 # 标准训练
                 embeddings = self.model(audio, video=video)
                 loss, loss_dict = self.criterion(embeddings, labels)
+
+                if self.skip_non_finite_batches and not torch.isfinite(loss.detach()).all():
+                    print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    pending_grad = False
+                    del audio, labels, embeddings, loss, batch
+                    if video is not None:
+                        del video
+                    continue
+
                 loss = loss / accumulation_steps
                 loss.backward()
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    pending_grad = False
+                    model_grad_norm, criterion_grad_norm = self._clip_gradients()
+                    if self.skip_non_finite_batches and (
+                        not self._is_finite_tensor(model_grad_norm) or
+                        not self._is_finite_tensor(criterion_grad_norm)
+                    ):
+                        print(f"警告: 第 {batch_idx} 个 batch 梯度出现非有限值，已跳过参数更新")
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pending_grad = False
+                    else:
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        pending_grad = False
                 else:
                     pending_grad = True
             
@@ -258,13 +328,29 @@ class Trainer:
         if pending_grad:
             if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                model_grad_norm, criterion_grad_norm = self._clip_gradients()
+                if self.skip_non_finite_batches and (
+                    not self._is_finite_tensor(model_grad_norm) or
+                    not self._is_finite_tensor(criterion_grad_norm)
+                ):
+                    print("警告: epoch 末尾累积梯度出现非有限值，已跳过本次更新")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                else:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
             else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                self.optimizer.step()
-            self.optimizer.zero_grad()
+                model_grad_norm, criterion_grad_norm = self._clip_gradients()
+                if self.skip_non_finite_batches and (
+                    not self._is_finite_tensor(model_grad_norm) or
+                    not self._is_finite_tensor(criterion_grad_norm)
+                ):
+                    print("警告: epoch 末尾累积梯度出现非有限值，已跳过本次更新")
+                    self.optimizer.zero_grad(set_to_none=True)
+                else:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
         
         if processed_batches == 0:
             return 0.0, 0.0, 0.0

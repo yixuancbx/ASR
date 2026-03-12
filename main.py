@@ -5,6 +5,7 @@ import torch
 import json
 import os
 import gc
+import random
 from model import SpeakerRecognitionModel
 from train import (
     Trainer,
@@ -40,6 +41,171 @@ def infer_dataset_type(train_list):
     except OSError:
         pass
     return None
+
+
+def _format_size(num_bytes):
+    """将字节数格式化为易读单位。"""
+    size = float(num_bytes)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0 or unit == 'TB':
+            return f"{size:.2f}{unit}"
+        size /= 1024.0
+    return f"{size:.2f}TB"
+
+
+def _resolve_media_path(media_path, data_root):
+    """将列表中的相对路径解析为绝对路径。"""
+    media_path = os.path.normpath(media_path)
+    if data_root and not os.path.isabs(media_path):
+        return os.path.join(data_root, media_path)
+    return media_path
+
+
+def _load_list_entries_with_size(list_file, data_root=None):
+    """读取列表文件并统计每个样本文件大小。"""
+    entries = []
+    skipped_invalid = 0
+    skipped_missing = 0
+
+    with open(list_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            parts = stripped.split()
+            if len(parts) < 2:
+                skipped_invalid += 1
+                continue
+
+            media_path = _resolve_media_path(parts[0], data_root=data_root)
+            if not os.path.exists(media_path):
+                skipped_missing += 1
+                continue
+
+            try:
+                size_bytes = os.path.getsize(media_path)
+            except OSError:
+                skipped_missing += 1
+                continue
+
+            entries.append({
+                'line': stripped,
+                'size_bytes': size_bytes,
+            })
+
+    return entries, skipped_invalid, skipped_missing
+
+
+def _sample_entries_to_target(entries, target_bytes, seed):
+    """随机采样，直到累计文件大小达到目标字节数。"""
+    if not entries:
+        return [], 0
+
+    if target_bytes is None or target_bytes <= 0:
+        first_entry = entries[0]
+        return [first_entry], first_entry['size_bytes']
+
+    shuffled = list(entries)
+    random.Random(seed).shuffle(shuffled)
+
+    selected = []
+    selected_bytes = 0
+    for entry in shuffled:
+        selected.append(entry)
+        selected_bytes += entry['size_bytes']
+        if selected_bytes >= target_bytes:
+            break
+
+    return selected, selected_bytes
+
+
+def create_size_limited_subset_lists(train_list,
+                                     val_list,
+                                     data_root=None,
+                                     target_size_gb=10.0,
+                                     subset_output_dir='subset_lists',
+                                     seed=42):
+    """
+    依据目标容量（GB）从 train/val 列表中采样子集，并写入新的列表文件。
+    目标容量按 train/val 原始容量比例分配。
+    """
+    target_total_bytes = int(float(target_size_gb) * 1024 * 1024 * 1024)
+    if target_total_bytes <= 0:
+        print("警告: 目标容量 <= 0，使用完整列表")
+        return train_list, val_list
+
+    train_entries, train_invalid, train_missing = _load_list_entries_with_size(train_list, data_root=data_root)
+    val_entries, val_invalid, val_missing = _load_list_entries_with_size(val_list, data_root=data_root)
+
+    train_total_bytes = sum(item['size_bytes'] for item in train_entries)
+    val_total_bytes = sum(item['size_bytes'] for item in val_entries)
+    available_total_bytes = train_total_bytes + val_total_bytes
+
+    print(
+        f"原始列表可用容量: train={_format_size(train_total_bytes)}, "
+        f"val={_format_size(val_total_bytes)}, total={_format_size(available_total_bytes)}"
+    )
+    if train_invalid + train_missing > 0:
+        print(f"训练列表跳过: 无效行 {train_invalid} 条, 缺失文件 {train_missing} 条")
+    if val_invalid + val_missing > 0:
+        print(f"验证列表跳过: 无效行 {val_invalid} 条, 缺失文件 {val_missing} 条")
+
+    if available_total_bytes == 0:
+        raise ValueError("列表中没有可用文件，无法按容量采样")
+
+    if target_total_bytes >= available_total_bytes:
+        print(
+            f"目标容量 {_format_size(target_total_bytes)} >= 可用容量 {_format_size(available_total_bytes)}，"
+            "将使用完整列表"
+        )
+        return train_list, val_list
+
+    train_ratio = train_total_bytes / available_total_bytes if available_total_bytes > 0 else 0.8
+    train_target_bytes = int(target_total_bytes * train_ratio)
+    val_target_bytes = target_total_bytes - train_target_bytes
+
+    if train_entries and train_target_bytes <= 0:
+        train_target_bytes = min(item['size_bytes'] for item in train_entries)
+    if val_entries and val_target_bytes <= 0:
+        val_target_bytes = min(item['size_bytes'] for item in val_entries)
+
+    selected_train_entries, selected_train_bytes = _sample_entries_to_target(
+        train_entries,
+        train_target_bytes,
+        seed=seed
+    )
+    selected_val_entries, selected_val_bytes = _sample_entries_to_target(
+        val_entries,
+        val_target_bytes,
+        seed=seed + 1
+    )
+
+    os.makedirs(subset_output_dir, exist_ok=True)
+    size_tag = str(target_size_gb).replace('.', 'p')
+    train_subset_list = os.path.join(subset_output_dir, f"train_subset_{size_tag}gb_seed{seed}.txt")
+    val_subset_list = os.path.join(subset_output_dir, f"val_subset_{size_tag}gb_seed{seed}.txt")
+
+    with open(train_subset_list, 'w', encoding='utf-8') as f:
+        for item in selected_train_entries:
+            f.write(item['line'] + '\n')
+
+    with open(val_subset_list, 'w', encoding='utf-8') as f:
+        for item in selected_val_entries:
+            f.write(item['line'] + '\n')
+
+    sampled_total_bytes = selected_train_bytes + selected_val_bytes
+    print(
+        f"容量采样完成: 目标≈{target_size_gb:.2f}GB, "
+        f"实际≈{_format_size(sampled_total_bytes)}"
+    )
+    print(
+        f"采样后样本数: train={len(selected_train_entries)}, "
+        f"val={len(selected_val_entries)}"
+    )
+    print(f"子集列表已生成: {train_subset_list}, {val_subset_list}")
+
+    return train_subset_list, val_subset_list
 
 
 def main():
@@ -155,6 +321,29 @@ def main():
             dataset_name = 'LRS'
         else:
             raise ValueError('无法根据列表文件推断数据集类型，请在config.json中设置 data.dataset_type')
+
+        max_dataset_size_gb = data_config.get('max_dataset_size_gb', None)
+        if max_dataset_size_gb is not None:
+            try:
+                max_dataset_size_gb = float(max_dataset_size_gb)
+            except (TypeError, ValueError):
+                print(f"警告: max_dataset_size_gb={max_dataset_size_gb} 无效，已忽略容量限制")
+                max_dataset_size_gb = None
+
+        if max_dataset_size_gb is not None and max_dataset_size_gb > 0:
+            subset_seed = int(data_config.get('subset_seed', 42))
+            subset_output_dir = data_config.get('subset_list_dir', 'subset_lists')
+            print(f"启用容量限制采样，目标总容量约 {max_dataset_size_gb:.2f}GB")
+            train_list, val_list = create_size_limited_subset_lists(
+                train_list=train_list,
+                val_list=val_list,
+                data_root=data_root,
+                target_size_gb=max_dataset_size_gb,
+                subset_output_dir=subset_output_dir,
+                seed=subset_seed
+            )
+        elif max_dataset_size_gb is not None and max_dataset_size_gb <= 0:
+            print("max_dataset_size_gb <= 0，忽略容量限制，使用完整列表")
 
         print(f"从列表文件加载数据集...")
         print(f"  数据集类型: {dataset_name}")
