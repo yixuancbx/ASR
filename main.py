@@ -430,7 +430,8 @@ def main():
         latest_checkpoint = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
         if os.path.exists(latest_checkpoint):
             print(f"\n发现之前的训练记录: {latest_checkpoint}")
-            response = input("是否从中断的地方继续训练？(y/n，默认y): ").strip().lower()
+            # response = input("是否从中断的地方继续训练？(y/n，默认y): ").strip().lower()
+            response = 'y'  # 强制自动从中断处继续训练
             if response in ['', 'y', 'yes']:
                 resume_checkpoint = latest_checkpoint
                 print("将从检查点继续训练...")

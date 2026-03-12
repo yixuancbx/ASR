@@ -52,7 +52,7 @@
     "pin_memory": false,
     "persistent_workers": false,
     "prefetch_factor": 1,
-    "data_root": "D:\\VPN\\wav",
+    "data_root": "/home/22009201043/wav",
     "train_list": "train_list.txt",
     "val_list": "val_list.txt"
   }

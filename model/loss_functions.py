@@ -62,7 +62,7 @@ class AAMSoftmaxLoss(nn.Module):
     Additive Angular Margin Softmax (ArcFace)
     相比 AM-Softmax 在角度空间上施加 margin，通常收敛更稳定、性能更好
     """
-    def __init__(self, embedding_dim, num_classes, margin=0.2, scale=30.0, eps=1e-7, easy_margin=False):
+    def __init__(self, embedding_dim, num_classes, margin=0.2, scale=30.0, eps=1e-4, easy_margin=False):
         super(AAMSoftmaxLoss, self).__init__()
         self.embedding_dim = embedding_dim
         self.num_classes = num_classes
