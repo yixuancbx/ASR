@@ -7,6 +7,10 @@
     "num_classes": 100,
     "num_heads": 8,
     "dropout": 0.1,
+    "temporal_pool_stride": 8,
+    "max_attention_frames": 2048,
+    "temporal_pool_type": "avg",
+    "use_attention_checkpoint": true,
     "use_video": false,
     "video_in_channels": 3,
     "video_channels": 32
@@ -35,7 +39,7 @@
     "max_train_batches": null,
     "max_val_batches": null,
     "accumulation_steps": 8,
-    "compile": true,
+    "compile": false,
     "scheduler": "cosine",
     "cosine_T0": 10,
     "cosine_Tmult": 2

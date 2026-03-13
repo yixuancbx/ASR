@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from .multi_scale_frontend import MultiScaleFeatureExtraction
 from .attention_modules import MultiLevelDynamicAttentionFusion
 
@@ -25,12 +26,32 @@ class SpeakerRecognitionModel(nn.Module):
                  num_classes=100,
                  num_heads=8,
                  dropout=0.1,
+                 temporal_pool_stride=1,
+                 max_attention_frames=0,
+                 temporal_pool_type='avg',
+                 use_attention_checkpoint=False,
                  use_video=False,
                  video_in_channels=3,
                  video_channels=32):
         super(SpeakerRecognitionModel, self).__init__()
         self.use_video = use_video
         self.embedding_dim = embedding_dim
+
+        expected_attention_channels = frontend_channels * 3
+        if attention_channels != expected_attention_channels:
+            print(
+                f"警告: attention_channels={attention_channels} 与 3*frontend_channels={expected_attention_channels} 不一致，"
+                "已自动调整为匹配值"
+            )
+            attention_channels = expected_attention_channels
+
+        self.temporal_pool_stride = max(1, int(temporal_pool_stride))
+        self.max_attention_frames = max(0, int(max_attention_frames))
+        self.temporal_pool_type = str(temporal_pool_type).lower()
+        if self.temporal_pool_type not in {'avg', 'max'}:
+            print(f"警告: temporal_pool_type={temporal_pool_type} 无效，已回退到 avg")
+            self.temporal_pool_type = 'avg'
+        self.use_attention_checkpoint = bool(use_attention_checkpoint)
         
         # 1. 多尺度特征提取前端
         self.multi_scale_frontend = MultiScaleFeatureExtraction(
@@ -117,6 +138,37 @@ class SpeakerRecognitionModel(nn.Module):
             return embedding
         return self.embedding_layers(pooled_features)
 
+    def _downsample_temporal(self, features):
+        """在进入全局注意力前进行时序降采样，降低显存占用。"""
+        if self.temporal_pool_stride > 1:
+            if self.temporal_pool_type == 'max':
+                features = F.max_pool1d(
+                    features,
+                    kernel_size=self.temporal_pool_stride,
+                    stride=self.temporal_pool_stride,
+                    ceil_mode=True
+                )
+            else:
+                features = F.avg_pool1d(
+                    features,
+                    kernel_size=self.temporal_pool_stride,
+                    stride=self.temporal_pool_stride,
+                    ceil_mode=True
+                )
+
+        if self.max_attention_frames > 0 and features.size(-1) > self.max_attention_frames:
+            features = F.adaptive_avg_pool1d(features, self.max_attention_frames)
+        return features
+
+    def _apply_attention_fusion(self, features):
+        """可选启用梯度检查点，用计算换显存。"""
+        if not (self.use_attention_checkpoint and self.training):
+            return self.attention_fusion(features)
+        try:
+            return torch_checkpoint(self.attention_fusion, features, use_reentrant=False)
+        except TypeError:
+            return torch_checkpoint(self.attention_fusion, features)
+
     def encode_audio(self, x):
         """
         提取音频说话人嵌入
@@ -133,14 +185,17 @@ class SpeakerRecognitionModel(nn.Module):
         
         # 2. 卷积特征提取
         features = self.conv_layers(features)  # [B, 3*C, T]
+
+        # 3. 时序降采样（显著降低后续注意力显存）
+        features = self._downsample_temporal(features)
+
+        # 4. 多层次动态注意力融合
+        attended_features = self._apply_attention_fusion(features)  # [B, 3*C, T]
         
-        # 3. 多层次动态注意力融合
-        attended_features = self.attention_fusion(features)  # [B, 3*C, T]
-        
-        # 4. 特征拼接与融合
+        # 5. 特征拼接与融合
         fused_features = self.feature_fusion(attended_features)  # [B, 3*C, T]
         
-        # 5. 统计池化（均值+标准差）
+        # 6. 统计池化（均值+标准差）
         mean = fused_features.mean(dim=2)
         std = fused_features.std(dim=2)
         pooled_features = torch.cat([mean, std], dim=1)  # [B, 2*3*C]

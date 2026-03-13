@@ -29,7 +29,11 @@ class SpeakerIdentifier:
             embedding_dim=config['embedding_dim'],
             num_classes=config['num_classes'],
             num_heads=config['num_heads'],
-            dropout=config['dropout']
+            dropout=config['dropout'],
+            temporal_pool_stride=config.get('temporal_pool_stride', 1),
+            max_attention_frames=config.get('max_attention_frames', 0),
+            temporal_pool_type=config.get('temporal_pool_type', 'avg'),
+            use_attention_checkpoint=config.get('use_attention_checkpoint', False)
         ).to(self.device)
         
         # 加载权重

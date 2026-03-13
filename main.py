@@ -269,6 +269,10 @@ def main():
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,
+        'temporal_pool_stride': 1,
+        'max_attention_frames': 0,
+        'temporal_pool_type': 'avg',
+        'use_attention_checkpoint': False,
     }
     for k, v in defaults.items():
         config.setdefault(k, v)
