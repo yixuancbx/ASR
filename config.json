@@ -52,9 +52,12 @@
     "pin_memory": false,
     "persistent_workers": false,
     "prefetch_factor": 1,
-    "data_root": "/home/22009201043/wav",
+    "data_root": "D:\\VPN\\wav",
     "train_list": "train_list.txt",
-    "val_list": "val_list.txt"
+    "val_list": "val_list.txt",
+    "max_dataset_size_gb": 10,
+    "subset_seed": 42,
+    "subset_list_dir": "subset_lists"
   }
 }
 

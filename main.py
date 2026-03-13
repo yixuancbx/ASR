@@ -6,6 +6,7 @@ import json
 import os
 import gc
 import random
+from collections import defaultdict
 from model import SpeakerRecognitionModel
 from train import (
     Trainer,
@@ -92,47 +93,37 @@ def _load_list_entries_with_size(list_file, data_root=None):
             entries.append({
                 'line': stripped,
                 'size_bytes': size_bytes,
+                'speaker_id': parts[1],
             })
 
     return entries, skipped_invalid, skipped_missing
 
 
-def _sample_entries_to_target(entries, target_bytes, seed):
-    """随机采样，直到累计文件大小达到目标字节数。"""
-    if not entries:
-        return [], 0
-
-    if target_bytes is None or target_bytes <= 0:
-        first_entry = entries[0]
-        return [first_entry], first_entry['size_bytes']
-
-    shuffled = list(entries)
-    random.Random(seed).shuffle(shuffled)
-
-    selected = []
-    selected_bytes = 0
-    for entry in shuffled:
-        selected.append(entry)
-        selected_bytes += entry['size_bytes']
-        if selected_bytes >= target_bytes:
-            break
-
-    return selected, selected_bytes
+def _group_entries_by_speaker(entries):
+    """按说话人分组。"""
+    grouped = defaultdict(list)
+    for item in entries:
+        grouped[item['speaker_id']].append(item)
+    return grouped
 
 
-def create_size_limited_subset_lists(train_list,
-                                     val_list,
-                                     data_root=None,
-                                     target_size_gb=10.0,
-                                     subset_output_dir='subset_lists',
-                                     seed=42):
+def create_speaker_limited_subset_lists(train_list,
+                                        val_list,
+                                        data_root=None,
+                                        target_num_speakers=500,
+                                        min_utterances_per_speaker=80,
+                                        subset_output_dir='subset_lists',
+                                        seed=42):
     """
-    依据目标容量（GB）从 train/val 列表中采样子集，并写入新的列表文件。
-    目标容量按 train/val 原始容量比例分配。
+    随机抽取指定数量的说话人，并保留其全部语音样本（train/val 同步过滤）。
+    可选地仅保留语音条数达到阈值的说话人，避免样本过少类别。
     """
-    target_total_bytes = int(float(target_size_gb) * 1024 * 1024 * 1024)
-    if target_total_bytes <= 0:
-        print("警告: 目标容量 <= 0，使用完整列表")
+    if target_num_speakers is None:
+        return train_list, val_list
+
+    target_num_speakers = int(target_num_speakers)
+    if target_num_speakers <= 0:
+        print("警告: target_num_speakers <= 0，使用完整列表")
         return train_list, val_list
 
     train_entries, train_invalid, train_missing = _load_list_entries_with_size(train_list, data_root=data_root)
@@ -152,39 +143,64 @@ def create_size_limited_subset_lists(train_list,
         print(f"验证列表跳过: 无效行 {val_invalid} 条, 缺失文件 {val_missing} 条")
 
     if available_total_bytes == 0:
-        raise ValueError("列表中没有可用文件，无法按容量采样")
+        raise ValueError("列表中没有可用文件，无法按说话人采样")
 
-    if target_total_bytes >= available_total_bytes:
-        print(
-            f"目标容量 {_format_size(target_total_bytes)} >= 可用容量 {_format_size(available_total_bytes)}，"
-            "将使用完整列表"
+    all_entries = train_entries + val_entries
+    grouped = _group_entries_by_speaker(all_entries)
+    all_speakers = sorted(grouped.keys())
+
+    if min_utterances_per_speaker is not None:
+        min_utterances_per_speaker = int(min_utterances_per_speaker)
+        if min_utterances_per_speaker <= 1:
+            min_utterances_per_speaker = None
+
+    if min_utterances_per_speaker is None:
+        eligible_speakers = all_speakers
+    else:
+        eligible_speakers = sorted([
+            speaker_id
+            for speaker_id, items in grouped.items()
+            if len(items) >= min_utterances_per_speaker
+        ])
+
+    if not eligible_speakers:
+        raise ValueError(
+            f"没有说话人满足最小语音条数要求: min_utterances_per_speaker={min_utterances_per_speaker}"
         )
-        return train_list, val_list
 
-    train_ratio = train_total_bytes / available_total_bytes if available_total_bytes > 0 else 0.8
-    train_target_bytes = int(target_total_bytes * train_ratio)
-    val_target_bytes = target_total_bytes - train_target_bytes
+    if target_num_speakers >= len(eligible_speakers):
+        selected_speakers = set(eligible_speakers)
+        print(
+            f"目标说话人数 {target_num_speakers} >= 可选说话人数 {len(eligible_speakers)}，"
+            "将使用全部可选说话人"
+        )
+    else:
+        selected_speakers = set(
+            random.Random(seed).sample(eligible_speakers, target_num_speakers)
+        )
 
-    if train_entries and train_target_bytes <= 0:
-        train_target_bytes = min(item['size_bytes'] for item in train_entries)
-    if val_entries and val_target_bytes <= 0:
-        val_target_bytes = min(item['size_bytes'] for item in val_entries)
+    selected_train_entries = [item for item in train_entries if item['speaker_id'] in selected_speakers]
+    selected_val_entries = [item for item in val_entries if item['speaker_id'] in selected_speakers]
 
-    selected_train_entries, selected_train_bytes = _sample_entries_to_target(
-        train_entries,
-        train_target_bytes,
-        seed=seed
-    )
-    selected_val_entries, selected_val_bytes = _sample_entries_to_target(
-        val_entries,
-        val_target_bytes,
-        seed=seed + 1
+    selected_train_bytes = sum(item['size_bytes'] for item in selected_train_entries)
+    selected_val_bytes = sum(item['size_bytes'] for item in selected_val_entries)
+    selected_total_bytes = selected_train_bytes + selected_val_bytes
+
+    selected_utterance_counts = [
+        len(grouped[speaker_id]) for speaker_id in sorted(selected_speakers)
+    ]
+    min_utt = min(selected_utterance_counts) if selected_utterance_counts else 0
+    max_utt = max(selected_utterance_counts) if selected_utterance_counts else 0
+    avg_utt = (
+        sum(selected_utterance_counts) / len(selected_utterance_counts)
+        if selected_utterance_counts else 0.0
     )
 
     os.makedirs(subset_output_dir, exist_ok=True)
-    size_tag = str(target_size_gb).replace('.', 'p')
-    train_subset_list = os.path.join(subset_output_dir, f"train_subset_{size_tag}gb_seed{seed}.txt")
-    val_subset_list = os.path.join(subset_output_dir, f"val_subset_{size_tag}gb_seed{seed}.txt")
+    utt_tag = f"_minutt{min_utterances_per_speaker}" if min_utterances_per_speaker else ""
+    speaker_tag = f"spk{len(selected_speakers)}{utt_tag}"
+    train_subset_list = os.path.join(subset_output_dir, f"train_subset_{speaker_tag}_seed{seed}.txt")
+    val_subset_list = os.path.join(subset_output_dir, f"val_subset_{speaker_tag}_seed{seed}.txt")
 
     with open(train_subset_list, 'w', encoding='utf-8') as f:
         for item in selected_train_entries:
@@ -194,10 +210,16 @@ def create_size_limited_subset_lists(train_list,
         for item in selected_val_entries:
             f.write(item['line'] + '\n')
 
-    sampled_total_bytes = selected_train_bytes + selected_val_bytes
     print(
-        f"容量采样完成: 目标≈{target_size_gb:.2f}GB, "
-        f"实际≈{_format_size(sampled_total_bytes)}"
+        f"按说话人采样完成: 保留 {len(selected_speakers)} 人, "
+        f"总样本={len(selected_train_entries) + len(selected_val_entries)}"
+    )
+    print(
+        f"保留后容量: train={_format_size(selected_train_bytes)}, "
+        f"val={_format_size(selected_val_bytes)}, total={_format_size(selected_total_bytes)}"
+    )
+    print(
+        f"每说话人语音条数统计: min={min_utt}, avg={avg_utt:.1f}, max={max_utt}"
     )
     print(
         f"采样后样本数: train={len(selected_train_entries)}, "
