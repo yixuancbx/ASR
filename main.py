@@ -6,7 +6,6 @@ import json
 import os
 import gc
 import random
-from collections import defaultdict
 from model import SpeakerRecognitionModel
 from train import (
     Trainer,
@@ -44,29 +43,10 @@ def infer_dataset_type(train_list):
     return None
 
 
-def _format_size(num_bytes):
-    """将字节数格式化为易读单位。"""
-    size = float(num_bytes)
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024.0 or unit == 'TB':
-            return f"{size:.2f}{unit}"
-        size /= 1024.0
-    return f"{size:.2f}TB"
-
-
-def _resolve_media_path(media_path, data_root):
-    """将列表中的相对路径解析为绝对路径。"""
-    media_path = os.path.normpath(media_path)
-    if data_root and not os.path.isabs(media_path):
-        return os.path.join(data_root, media_path)
-    return media_path
-
-
-def _load_list_entries_with_size(list_file, data_root=None):
-    """读取列表文件并统计每个样本文件大小。"""
+def _load_list_entries_with_speaker(list_file):
+    """读取列表文件，提取原始行和 speaker_id。"""
     entries = []
     skipped_invalid = 0
-    skipped_missing = 0
 
     with open(list_file, 'r', encoding='utf-8') as f:
         for line in f:
@@ -79,128 +59,102 @@ def _load_list_entries_with_size(list_file, data_root=None):
                 skipped_invalid += 1
                 continue
 
-            media_path = _resolve_media_path(parts[0], data_root=data_root)
-            if not os.path.exists(media_path):
-                skipped_missing += 1
-                continue
-
-            try:
-                size_bytes = os.path.getsize(media_path)
-            except OSError:
-                skipped_missing += 1
-                continue
-
             entries.append({
                 'line': stripped,
-                'size_bytes': size_bytes,
                 'speaker_id': parts[1],
             })
 
-    return entries, skipped_invalid, skipped_missing
+    return entries, skipped_invalid
 
 
-def _group_entries_by_speaker(entries):
-    """按说话人分组。"""
-    grouped = defaultdict(list)
+def _count_utterances_by_speaker(entries):
+    """统计每个说话人的样本条数。"""
+    speaker_counts = {}
     for item in entries:
-        grouped[item['speaker_id']].append(item)
-    return grouped
+        speaker_id = item['speaker_id']
+        speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+    return speaker_counts
+
+
+def _format_count_stats(values):
+    """格式化 min/avg/max 统计信息。"""
+    if not values:
+        return "min=0, avg=0.00, max=0"
+    return f"min={min(values)}, avg={sum(values) / len(values):.2f}, max={max(values)}"
 
 
 def create_speaker_limited_subset_lists(train_list,
                                         val_list,
-                                        data_root=None,
-                                        target_num_speakers=500,
+                                        subset_num_speakers=500,
                                         min_utterances_per_speaker=80,
                                         subset_output_dir='subset_lists',
                                         seed=42):
     """
-    随机抽取指定数量的说话人，并保留其全部语音样本（train/val 同步过滤）。
-    可选地仅保留语音条数达到阈值的说话人，避免样本过少类别。
+    先随机采样说话人，再保留这些说话人的全部语音。
+    说话人从训练列表中抽样，验证列表按同一说话人集合过滤，确保标签空间一致。
     """
-    if target_num_speakers is None:
+    subset_num_speakers = int(subset_num_speakers)
+    min_utterances_per_speaker = int(min_utterances_per_speaker)
+    if subset_num_speakers <= 0:
+        print("警告: subset_num_speakers <= 0，使用完整列表")
         return train_list, val_list
 
-    target_num_speakers = int(target_num_speakers)
-    if target_num_speakers <= 0:
-        print("警告: target_num_speakers <= 0，使用完整列表")
-        return train_list, val_list
+    train_entries, train_invalid = _load_list_entries_with_speaker(train_list)
+    val_entries, val_invalid = _load_list_entries_with_speaker(val_list)
 
-    train_entries, train_invalid, train_missing = _load_list_entries_with_size(train_list, data_root=data_root)
-    val_entries, val_invalid, val_missing = _load_list_entries_with_size(val_list, data_root=data_root)
+    if train_invalid > 0:
+        print(f"训练列表跳过无效行: {train_invalid} 条")
+    if val_invalid > 0:
+        print(f"验证列表跳过无效行: {val_invalid} 条")
 
-    train_total_bytes = sum(item['size_bytes'] for item in train_entries)
-    val_total_bytes = sum(item['size_bytes'] for item in val_entries)
-    available_total_bytes = train_total_bytes + val_total_bytes
+    if not train_entries:
+        raise ValueError("训练列表中没有可用样本，无法按说话人采样")
 
-    print(
-        f"原始列表可用容量: train={_format_size(train_total_bytes)}, "
-        f"val={_format_size(val_total_bytes)}, total={_format_size(available_total_bytes)}"
-    )
-    if train_invalid + train_missing > 0:
-        print(f"训练列表跳过: 无效行 {train_invalid} 条, 缺失文件 {train_missing} 条")
-    if val_invalid + val_missing > 0:
-        print(f"验证列表跳过: 无效行 {val_invalid} 条, 缺失文件 {val_missing} 条")
+    train_counts = _count_utterances_by_speaker(train_entries)
+    val_counts = _count_utterances_by_speaker(val_entries)
 
-    if available_total_bytes == 0:
-        raise ValueError("列表中没有可用文件，无法按说话人采样")
+    all_train_speakers = sorted(train_counts.keys())
+    total_counts = {
+        speaker_id: train_counts.get(speaker_id, 0) + val_counts.get(speaker_id, 0)
+        for speaker_id in all_train_speakers
+    }
 
-    all_entries = train_entries + val_entries
-    grouped = _group_entries_by_speaker(all_entries)
-    all_speakers = sorted(grouped.keys())
-
-    if min_utterances_per_speaker is not None:
-        min_utterances_per_speaker = int(min_utterances_per_speaker)
-        if min_utterances_per_speaker <= 1:
-            min_utterances_per_speaker = None
-
-    if min_utterances_per_speaker is None:
-        eligible_speakers = all_speakers
+    if min_utterances_per_speaker > 0:
+        candidate_speakers = [
+            speaker_id for speaker_id in all_train_speakers
+            if total_counts[speaker_id] >= min_utterances_per_speaker
+        ]
     else:
-        eligible_speakers = sorted([
-            speaker_id
-            for speaker_id, items in grouped.items()
-            if len(items) >= min_utterances_per_speaker
-        ])
+        candidate_speakers = list(all_train_speakers)
 
-    if not eligible_speakers:
+    if not candidate_speakers:
         raise ValueError(
-            f"没有说话人满足最小语音条数要求: min_utterances_per_speaker={min_utterances_per_speaker}"
+            f"没有说话人满足最小语音条数阈值: min_utterances_per_speaker={min_utterances_per_speaker}"
         )
 
-    if target_num_speakers >= len(eligible_speakers):
-        selected_speakers = set(eligible_speakers)
-        print(
-            f"目标说话人数 {target_num_speakers} >= 可选说话人数 {len(eligible_speakers)}，"
-            "将使用全部可选说话人"
-        )
+    rng = random.Random(seed)
+    if len(candidate_speakers) > subset_num_speakers:
+        selected_speakers = set(rng.sample(candidate_speakers, subset_num_speakers))
     else:
-        selected_speakers = set(
-            random.Random(seed).sample(eligible_speakers, target_num_speakers)
-        )
+        selected_speakers = set(candidate_speakers)
+        if len(candidate_speakers) < subset_num_speakers:
+            print(
+                f"警告: 满足阈值的说话人仅有 {len(candidate_speakers)} 个，"
+                f"小于目标 {subset_num_speakers} 个，将全部保留"
+            )
 
     selected_train_entries = [item for item in train_entries if item['speaker_id'] in selected_speakers]
     selected_val_entries = [item for item in val_entries if item['speaker_id'] in selected_speakers]
 
-    selected_train_bytes = sum(item['size_bytes'] for item in selected_train_entries)
-    selected_val_bytes = sum(item['size_bytes'] for item in selected_val_entries)
-    selected_total_bytes = selected_train_bytes + selected_val_bytes
-
-    selected_utterance_counts = [
-        len(grouped[speaker_id]) for speaker_id in sorted(selected_speakers)
-    ]
-    min_utt = min(selected_utterance_counts) if selected_utterance_counts else 0
-    max_utt = max(selected_utterance_counts) if selected_utterance_counts else 0
-    avg_utt = (
-        sum(selected_utterance_counts) / len(selected_utterance_counts)
-        if selected_utterance_counts else 0.0
-    )
-
     os.makedirs(subset_output_dir, exist_ok=True)
-    utt_tag = f"_minutt{min_utterances_per_speaker}" if min_utterances_per_speaker else ""
-    speaker_tag = f"spk{len(selected_speakers)}{utt_tag}"
-    train_subset_list = os.path.join(subset_output_dir, f"train_subset_{speaker_tag}_seed{seed}.txt")
-    val_subset_list = os.path.join(subset_output_dir, f"val_subset_{speaker_tag}_seed{seed}.txt")
+    train_subset_list = os.path.join(
+        subset_output_dir,
+        f"train_subset_spk{subset_num_speakers}_min{max(min_utterances_per_speaker, 0)}_seed{seed}.txt"
+    )
+    val_subset_list = os.path.join(
+        subset_output_dir,
+        f"val_subset_spk{subset_num_speakers}_min{max(min_utterances_per_speaker, 0)}_seed{seed}.txt"
+    )
 
     with open(train_subset_list, 'w', encoding='utf-8') as f:
         for item in selected_train_entries:
@@ -210,21 +164,24 @@ def create_speaker_limited_subset_lists(train_list,
         for item in selected_val_entries:
             f.write(item['line'] + '\n')
 
+    per_speaker_train_counts = [train_counts.get(speaker_id, 0) for speaker_id in selected_speakers]
+    per_speaker_val_counts = [val_counts.get(speaker_id, 0) for speaker_id in selected_speakers]
+    per_speaker_total_counts = [
+        train_counts.get(speaker_id, 0) + val_counts.get(speaker_id, 0)
+        for speaker_id in selected_speakers
+    ]
+
     print(
-        f"按说话人采样完成: 保留 {len(selected_speakers)} 人, "
-        f"总样本={len(selected_train_entries) + len(selected_val_entries)}"
-    )
-    print(
-        f"保留后容量: train={_format_size(selected_train_bytes)}, "
-        f"val={_format_size(selected_val_bytes)}, total={_format_size(selected_total_bytes)}"
-    )
-    print(
-        f"每说话人语音条数统计: min={min_utt}, avg={avg_utt:.1f}, max={max_utt}"
+        f"说话人采样完成: 目标说话人={subset_num_speakers}, 实际保留={len(selected_speakers)}, "
+        f"min_utterances_per_speaker={min_utterances_per_speaker}"
     )
     print(
         f"采样后样本数: train={len(selected_train_entries)}, "
         f"val={len(selected_val_entries)}"
     )
+    print(f"每说话人样本统计(train): {_format_count_stats(per_speaker_train_counts)}")
+    print(f"每说话人样本统计(val): {_format_count_stats(per_speaker_val_counts)}")
+    print(f"每说话人样本统计(total): {_format_count_stats(per_speaker_total_counts)}")
     print(f"子集列表已生成: {train_subset_list}, {val_subset_list}")
 
     return train_subset_list, val_subset_list
@@ -344,28 +301,54 @@ def main():
         else:
             raise ValueError('无法根据列表文件推断数据集类型，请在config.json中设置 data.dataset_type')
 
-        max_dataset_size_gb = data_config.get('max_dataset_size_gb', None)
-        if max_dataset_size_gb is not None:
-            try:
-                max_dataset_size_gb = float(max_dataset_size_gb)
-            except (TypeError, ValueError):
-                print(f"警告: max_dataset_size_gb={max_dataset_size_gb} 无效，已忽略容量限制")
-                max_dataset_size_gb = None
+        subset_num_speakers = data_config.get('subset_num_speakers', None)
+        if subset_num_speakers is None and data_config.get('max_dataset_size_gb', None) is not None:
+            # 兼容旧配置：此前通过 max_dataset_size_gb 触发随机容量抽样，
+            # 现在改为优先保证说话人完整性，默认采样 500 个说话人。
+            subset_num_speakers = 500
+            print(
+                f"检测到旧配置 max_dataset_size_gb={data_config.get('max_dataset_size_gb')}，"
+                "已切换为按说话人采样（默认 500 人）"
+            )
 
-        if max_dataset_size_gb is not None and max_dataset_size_gb > 0:
-            subset_seed = int(data_config.get('subset_seed', 42))
+        if subset_num_speakers is not None:
+            try:
+                subset_num_speakers = int(subset_num_speakers)
+            except (TypeError, ValueError):
+                print(f"警告: subset_num_speakers={subset_num_speakers} 无效，忽略说话人采样")
+                subset_num_speakers = None
+
+        if subset_num_speakers is not None and subset_num_speakers > 0:
+            subset_seed_raw = data_config.get('subset_seed', 42)
+            subset_min_utterances_raw = data_config.get('subset_min_utterances', 80)
             subset_output_dir = data_config.get('subset_list_dir', 'subset_lists')
-            print(f"启用容量限制采样，目标总容量约 {max_dataset_size_gb:.2f}GB")
-            train_list, val_list = create_size_limited_subset_lists(
+
+            try:
+                subset_seed = int(subset_seed_raw)
+            except (TypeError, ValueError):
+                print(f"警告: subset_seed={subset_seed_raw} 无效，使用默认值 42")
+                subset_seed = 42
+
+            try:
+                subset_min_utterances = int(subset_min_utterances_raw)
+            except (TypeError, ValueError):
+                print(f"警告: subset_min_utterances={subset_min_utterances_raw} 无效，使用默认值 80")
+                subset_min_utterances = 80
+
+            print(
+                f"启用说话人采样，目标保留 {subset_num_speakers} 个说话人，"
+                f"每个说话人至少 {subset_min_utterances} 条语音"
+            )
+            train_list, val_list = create_speaker_limited_subset_lists(
                 train_list=train_list,
                 val_list=val_list,
-                data_root=data_root,
-                target_size_gb=max_dataset_size_gb,
+                subset_num_speakers=subset_num_speakers,
+                min_utterances_per_speaker=subset_min_utterances,
                 subset_output_dir=subset_output_dir,
                 seed=subset_seed
             )
-        elif max_dataset_size_gb is not None and max_dataset_size_gb <= 0:
-            print("max_dataset_size_gb <= 0，忽略容量限制，使用完整列表")
+        elif subset_num_speakers is not None and subset_num_speakers <= 0:
+            print("subset_num_speakers <= 0，忽略说话人采样，使用完整列表")
 
         print(f"从列表文件加载数据集...")
         print(f"  数据集类型: {dataset_name}")
