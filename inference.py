@@ -243,6 +243,10 @@ class SpeakerIdentifier:
             use_video=self.config.get("use_video", False),
             video_in_channels=self.config.get("video_in_channels", 3),
             video_channels=self.config.get("video_channels", 32),
+            visual_encoder_dropout=self.config.get("visual_encoder_dropout", self.config.get("dropout", 0.1)),
+            fusion_dropout=self.config.get("fusion_dropout", self.config.get("dropout", 0.1)),
+            modality_dropout=self.config.get("modality_dropout", 0.0),
+            fusion_num_heads=self.config.get("fusion_num_heads", 4),
         ).to(self.device)
 
         state_dict = checkpoint.get("model_state_dict", checkpoint)

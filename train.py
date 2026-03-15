@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
@@ -82,7 +83,11 @@ class Trainer:
             use_attention_checkpoint=config.get('use_attention_checkpoint', False),
             use_video=config.get('use_video', False),
             video_in_channels=config.get('video_in_channels', 3),
-            video_channels=config.get('video_channels', 32)
+            video_channels=config.get('video_channels', 24),
+            visual_encoder_dropout=config.get('visual_encoder_dropout', config.get('dropout', 0.1)),
+            fusion_dropout=config.get('fusion_dropout', config.get('dropout', 0.1)),
+            modality_dropout=config.get('modality_dropout', 0.0),
+            fusion_num_heads=config.get('fusion_num_heads', 4),
         ).to(self.device)
         # 可选编译加速（需要 PyTorch 2.0+）
         if self.config.get('compile', False) and hasattr(torch, "compile"):
@@ -138,12 +143,16 @@ class Trainer:
         self.compute_eer_enabled = config.get('compute_eer', False)
         self.eer_max_samples = config.get('eer_max_samples', 2048)
         self.empty_cache_each_epoch = config.get('empty_cache_each_epoch', True)
+        self.lambda_modal_align = float(config.get('lambda_modal_align', 0.0))
+        if config.get('use_video', False) and self.lambda_modal_align > 0:
+            print(f"启用跨模态对齐损失: lambda_modal_align={self.lambda_modal_align:.4f}")
         
         # 训练历史
         self.train_history = {
             'loss': [],
             'am_loss': [],
-            'intra_loss': []
+            'intra_loss': [],
+            'modal_align_loss': [],
         }
 
     def _load_state_dict_flexible(self, state_dict):
@@ -178,6 +187,39 @@ class Trainer:
         audio = audio.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
         return audio, None, labels
+
+    def _forward_and_compute_loss(self, audio, video, labels):
+        need_modal_outputs = (
+            video is not None and
+            self.config.get('use_video', False) and
+            self.lambda_modal_align > 0
+        )
+        model_outputs = self.model(
+            audio,
+            video=video,
+            return_modal_embeddings=need_modal_outputs,
+        )
+
+        if isinstance(model_outputs, dict):
+            embeddings = model_outputs['embedding']
+            audio_embedding = model_outputs.get('audio_embedding')
+            video_embedding = model_outputs.get('video_embedding')
+        else:
+            embeddings = model_outputs
+            audio_embedding = None
+            video_embedding = None
+
+        loss, loss_dict = self.criterion(embeddings, labels)
+        loss_dict = dict(loss_dict)
+        loss_dict.setdefault('modal_align_loss', 0.0)
+
+        if audio_embedding is not None and video_embedding is not None:
+            modal_align_loss = (1.0 - F.cosine_similarity(audio_embedding, video_embedding, dim=1)).mean()
+            loss = loss + self.lambda_modal_align * modal_align_loss
+            loss_dict['modal_align_loss'] = modal_align_loss.detach().item()
+            loss_dict['total_loss'] = loss.detach().item()
+
+        return embeddings, loss, loss_dict
 
     def _maybe_release_memory(self):
         gc.collect()
@@ -216,6 +258,7 @@ class Trainer:
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
+        total_modal_align_loss = 0.0
         processed_batches = 0
         accumulation_steps = max(1, self.config.get('accumulation_steps', 1))
         max_batches = self.config.get('max_train_batches', None)
@@ -234,8 +277,7 @@ class Trainer:
             # 使用混合精度训练
             if self.use_amp:
                 with autocast():
-                    embeddings = self.model(audio, video=video)
-                    loss, loss_dict = self.criterion(embeddings, labels)
+                    embeddings, loss, loss_dict = self._forward_and_compute_loss(audio, video, labels)
 
                 if self.skip_non_finite_batches and not torch.isfinite(loss.detach()).all():
                     print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
@@ -269,8 +311,7 @@ class Trainer:
                     pending_grad = True
             else:
                 # 标准训练
-                embeddings = self.model(audio, video=video)
-                loss, loss_dict = self.criterion(embeddings, labels)
+                embeddings, loss, loss_dict = self._forward_and_compute_loss(audio, video, labels)
 
                 if self.skip_non_finite_batches and not torch.isfinite(loss.detach()).all():
                     print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
@@ -303,6 +344,7 @@ class Trainer:
             total_loss += loss_dict['total_loss']
             total_am_loss += loss_dict['am_loss']
             total_intra_loss += loss_dict['intra_loss']
+            total_modal_align_loss += loss_dict.get('modal_align_loss', 0.0)
             processed_batches += 1
             
             # 更新进度条（减少更新频率以提升性能）
@@ -314,11 +356,14 @@ class Trainer:
                         'mem': f"{memory_used:.2f}GB"
                     })
                 else:
-                    pbar.set_postfix({
+                    postfix = {
                         'loss': f"{loss_dict['total_loss']:.4f}",
                         'am_loss': f"{loss_dict['am_loss']:.4f}",
-                        'intra_loss': f"{loss_dict['intra_loss']:.4f}"
-                    })
+                        'intra_loss': f"{loss_dict['intra_loss']:.4f}",
+                    }
+                    if self.config.get('use_video', False) and self.lambda_modal_align > 0:
+                        postfix['av_align'] = f"{loss_dict.get('modal_align_loss', 0.0):.4f}"
+                    pbar.set_postfix(postfix)
             
             # 减少垃圾回收频率（从每50个batch改为每200个batch）
             if batch_idx % 200 == 0:
@@ -357,13 +402,14 @@ class Trainer:
                     self.optimizer.zero_grad(set_to_none=True)
         
         if processed_batches == 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
 
         avg_loss = total_loss / processed_batches
         avg_am_loss = total_am_loss / processed_batches
         avg_intra_loss = total_intra_loss / processed_batches
+        avg_modal_align_loss = total_modal_align_loss / processed_batches
         
-        return avg_loss, avg_am_loss, avg_intra_loss
+        return avg_loss, avg_am_loss, avg_intra_loss, avg_modal_align_loss
     
     def validate(self, dataloader):
         """验证，增加 EER 度量"""
@@ -371,6 +417,7 @@ class Trainer:
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
+        total_modal_align_loss = 0.0
         processed_batches = 0
         max_batches = self.config.get('max_val_batches', None)
         all_embeddings = []
@@ -387,15 +434,14 @@ class Trainer:
                 # 使用混合精度（推理时也可以加速）
                 if self.use_amp:
                     with autocast():
-                        embeddings = self.model(audio, video=video)
-                        loss, loss_dict = self.criterion(embeddings, labels)
+                        embeddings, loss, loss_dict = self._forward_and_compute_loss(audio, video, labels)
                 else:
-                    embeddings = self.model(audio, video=video)
-                    loss, loss_dict = self.criterion(embeddings, labels)
+                    embeddings, loss, loss_dict = self._forward_and_compute_loss(audio, video, labels)
                 
                 total_loss += loss_dict['total_loss']
                 total_am_loss += loss_dict['am_loss']
                 total_intra_loss += loss_dict['intra_loss']
+                total_modal_align_loss += loss_dict.get('modal_align_loss', 0.0)
                 processed_batches += 1
 
                 if self.compute_eer_enabled and stored_samples < self.eer_max_samples:
@@ -412,17 +458,18 @@ class Trainer:
                     gc.collect()
         
         if processed_batches == 0:
-            return 0.0, 0.0, 0.0, None
+            return 0.0, 0.0, 0.0, 0.0, None
 
         avg_loss = total_loss / processed_batches
         avg_am_loss = total_am_loss / processed_batches
         avg_intra_loss = total_intra_loss / processed_batches
+        avg_modal_align_loss = total_modal_align_loss / processed_batches
         eer = self.compute_eer(all_embeddings, all_labels) if self.compute_eer_enabled else None
 
         del all_embeddings, all_labels
         self._maybe_release_memory()
         
-        return avg_loss, avg_am_loss, avg_intra_loss, eer
+        return avg_loss, avg_am_loss, avg_intra_loss, avg_modal_align_loss, eer
 
     def compute_eer(self, embedding_chunks, label_chunks):
         """根据验证集嵌入计算 EER（Equal Error Rate）"""
@@ -496,7 +543,11 @@ class Trainer:
 
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.train_history = checkpoint.get('train_history', {'loss': [], 'am_loss': [], 'intra_loss': []})
+            self.train_history = checkpoint.get(
+                'train_history',
+                {'loss': [], 'am_loss': [], 'intra_loss': [], 'modal_align_loss': []}
+            )
+            self.train_history.setdefault('modal_align_loss', [])
             print(f"从第 {start_epoch} 轮继续训练（已完成 {checkpoint['epoch']} 轮）")
             if 'best_val_loss' in checkpoint:
                 print(f"当前最佳验证损失: {best_val_loss:.4f}")
@@ -510,24 +561,51 @@ class Trainer:
             print("-" * 50)
             
             # 训练
-            train_loss, train_am_loss, train_intra_loss = self.train_epoch(train_loader)
+            train_loss, train_am_loss, train_intra_loss, train_modal_align_loss = self.train_epoch(train_loader)
             
             # 记录训练历史
             self.train_history['loss'].append(train_loss)
             self.train_history['am_loss'].append(train_am_loss)
             self.train_history['intra_loss'].append(train_intra_loss)
+            self.train_history['modal_align_loss'].append(train_modal_align_loss)
             
-            print(f"训练损失: {train_loss:.4f} (AM: {train_am_loss:.4f}, Intra: {train_intra_loss:.4f})")
+            if self.config.get('use_video', False) and self.lambda_modal_align > 0:
+                print(
+                    f"训练损失: {train_loss:.4f} "
+                    f"(AM: {train_am_loss:.4f}, Intra: {train_intra_loss:.4f}, AVAlign: {train_modal_align_loss:.4f})"
+                )
+            else:
+                print(f"训练损失: {train_loss:.4f} (AM: {train_am_loss:.4f}, Intra: {train_intra_loss:.4f})")
             
             # 验证
             should_validate = val_loader is not None and ((epoch + 1) % val_interval == 0 or epoch == num_epochs - 1)
             if should_validate:
-                val_loss, val_am_loss, val_intra_loss, val_eer = self.validate(val_loader)
+                val_loss, val_am_loss, val_intra_loss, val_modal_align_loss, val_eer = self.validate(val_loader)
                 if val_eer is not None:
-                    print(f"验证损失: {val_loss:.4f} (AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {val_eer:.4f}")
+                    if self.config.get('use_video', False) and self.lambda_modal_align > 0:
+                        print(
+                            f"验证损失: {val_loss:.4f} "
+                            f"(AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}, AVAlign: {val_modal_align_loss:.4f}), "
+                            f"EER: {val_eer:.4f}"
+                        )
+                    else:
+                        print(
+                            f"验证损失: {val_loss:.4f} "
+                            f"(AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {val_eer:.4f}"
+                        )
                 else:
                     eer_msg = "未计算" if not self.compute_eer_enabled else "N/A（正负样本不足）"
-                    print(f"验证损失: {val_loss:.4f} (AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {eer_msg}")
+                    if self.config.get('use_video', False) and self.lambda_modal_align > 0:
+                        print(
+                            f"验证损失: {val_loss:.4f} "
+                            f"(AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}, AVAlign: {val_modal_align_loss:.4f}), "
+                            f"EER: {eer_msg}"
+                        )
+                    else:
+                        print(
+                            f"验证损失: {val_loss:.4f} "
+                            f"(AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {eer_msg}"
+                        )
                 
                 # 保存最佳模型
                 if val_loss < best_val_loss:
@@ -611,7 +689,11 @@ class Trainer:
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.train_history = checkpoint.get('train_history', {'loss': [], 'am_loss': [], 'intra_loss': []})
+        self.train_history = checkpoint.get(
+            'train_history',
+            {'loss': [], 'am_loss': [], 'intra_loss': [], 'modal_align_loss': []}
+        )
+        self.train_history.setdefault('modal_align_loss', [])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"加载检查点: {checkpoint_path} (Epoch {checkpoint['epoch']})")
@@ -824,6 +906,8 @@ def create_vox2video_dataset_from_list(train_list,
                                        num_workers=4,
                                        num_frames=8,
                                        frame_size=112,
+                                       frame_stride=2,
+                                       align_av_segment=True,
                                        pin_memory=None,
                                        persistent_workers=False,
                                        prefetch_factor=1):
@@ -837,8 +921,10 @@ def create_vox2video_dataset_from_list(train_list,
         segment_length=segment_length,
         num_frames=num_frames,
         frame_size=frame_size,
+        frame_stride=frame_stride,
         train=True,
-        augmentation=augmentation
+        augmentation=augmentation,
+        align_av_segment=align_av_segment,
     )
 
     val_dataset = Vox2VideoDatasetFromList(
@@ -848,10 +934,12 @@ def create_vox2video_dataset_from_list(train_list,
         segment_length=segment_length,
         num_frames=num_frames,
         frame_size=frame_size,
+        frame_stride=frame_stride,
         train=False,
         augmentation=False,
         speaker_to_id=train_dataset.speaker_to_id,
-        allow_new_speakers=False
+        allow_new_speakers=False,
+        align_av_segment=align_av_segment,
     )
 
     num_classes = train_dataset.get_num_speakers()

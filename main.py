@@ -34,13 +34,91 @@ def infer_dataset_type(train_list):
                 file_path = line.split()[0].lower()
                 if file_path.endswith('.wav'):
                     return 'voxceleb'
-                if file_path.endswith(('.mp4', '.avi', '.mov')):
-                    if 'vox' in file_path:
-                        return 'vox2video'
-                    return 'lrs'
+                if file_path.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+                    if 'lrs' in file_path:
+                        return 'lrs'
+                    return 'vox2video'
     except OSError:
         pass
     return None
+
+
+def _parse_extensions(raw_extensions):
+    if raw_extensions is None:
+        return None
+
+    if isinstance(raw_extensions, str):
+        items = [item.strip() for item in raw_extensions.split(',')]
+    elif isinstance(raw_extensions, (list, tuple)):
+        items = [str(item).strip() for item in raw_extensions]
+    else:
+        return None
+
+    items = [item for item in items if item]
+    return items if items else None
+
+
+def maybe_generate_vox2video_lists(data_config, train_list, val_list):
+    """
+    可选自动生成 Vox2Video train/val 列表。
+    触发条件:
+      1) data.auto_generate_lists=true
+      2) train_list / val_list 缺失或文件不存在
+    """
+    auto_generate = bool(data_config.get('auto_generate_lists', False))
+    if not auto_generate:
+        return train_list, val_list
+
+    train_ready = bool(train_list and os.path.exists(train_list))
+    val_ready = bool(val_list and os.path.exists(val_list))
+    if train_ready and val_ready:
+        return train_list, val_list
+
+    data_root = data_config.get('data_root')
+    if not data_root:
+        raise ValueError("启用 data.auto_generate_lists 时必须设置 data.data_root")
+
+    output_dir = data_config.get('list_output_dir', 'lists')
+    os.makedirs(output_dir, exist_ok=True)
+    train_list = train_list or os.path.join(output_dir, 'vox2video_train_list.txt')
+    val_list = val_list or os.path.join(output_dir, 'vox2video_val_list.txt')
+
+    try:
+        list_seed = int(data_config.get('list_seed', data_config.get('subset_seed', 42)))
+    except (TypeError, ValueError):
+        list_seed = 42
+
+    try:
+        min_samples = int(data_config.get('list_min_samples_per_speaker', 2))
+    except (TypeError, ValueError):
+        min_samples = 2
+
+    max_speakers = data_config.get('list_max_speakers', None)
+    if max_speakers is not None:
+        try:
+            max_speakers = int(max_speakers)
+        except (TypeError, ValueError):
+            print(f"警告: list_max_speakers={max_speakers} 无效，忽略该限制")
+            max_speakers = None
+
+    video_extensions = _parse_extensions(data_config.get('video_extensions', None))
+    speaker_prefix = data_config.get('speaker_prefix', 'id')
+    train_ratio = float(data_config.get('train_ratio', 0.9))
+
+    print("检测到 Vox2Video 自动列表生成功能，正在扫描数据目录...")
+    from prepare_vox2video_list import generate_and_split_from_directory
+    generate_and_split_from_directory(
+        data_root=data_root,
+        train_list_file=train_list,
+        val_list_file=val_list,
+        train_ratio=train_ratio,
+        seed=list_seed,
+        min_samples_per_speaker=min_samples,
+        max_speakers=max_speakers,
+        speaker_prefix=speaker_prefix,
+        extensions=video_extensions
+    )
+    return train_list, val_list
 
 
 def _load_list_entries_with_speaker(list_file):
@@ -269,6 +347,11 @@ def main():
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,
+        'visual_encoder_dropout': 0.1,
+        'fusion_dropout': 0.1,
+        'modality_dropout': 0.0,
+        'fusion_num_heads': 4,
+        'lambda_modal_align': 0.0,
         'temporal_pool_stride': 1,
         'max_attention_frames': 0,
         'temporal_pool_type': 'avg',
@@ -286,6 +369,13 @@ def main():
     train_list = data_config.get('train_list', None)
     val_list = data_config.get('val_list', None)
     dataset_type = data_config.get('dataset_type')
+
+    if dataset_type == 'vox2video':
+        train_list, val_list = maybe_generate_vox2video_lists(
+            data_config=data_config,
+            train_list=train_list,
+            val_list=val_list
+        )
     
     if train_list and val_list:
         inferred_dataset_type = infer_dataset_type(train_list)
@@ -374,11 +464,25 @@ def main():
         if dataset_type == 'vox2video':
             loader_kwargs['num_frames'] = data_config.get('video_num_frames', 8)
             loader_kwargs['frame_size'] = data_config.get('video_frame_size', 112)
+            loader_kwargs['frame_stride'] = data_config.get('video_frame_stride', 2)
+            loader_kwargs['align_av_segment'] = data_config.get('align_av_segment', True)
 
         train_loader, val_loader, num_classes = dataset_loader(**loader_kwargs)
         # 更新配置中的说话人数量
         config['num_classes'] = num_classes
         config['use_video'] = (dataset_type == 'vox2video')
+        if config['use_video']:
+            model_cfg = config_dict.get('model', {})
+            training_cfg = config_dict.get('training', {})
+            loss_cfg = config_dict.get('loss', {})
+            lambda_defined = any(
+                'lambda_modal_align' in section_cfg
+                for section_cfg in (model_cfg, training_cfg, loss_cfg)
+            )
+            if not lambda_defined and config.get('lambda_modal_align', 0.0) <= 0:
+                config['lambda_modal_align'] = 0.05
+                print("未显式设置 lambda_modal_align，Vox2Video 训练默认启用 0.05")
+        config_dict.setdefault('model', {})
         config_dict['model']['num_classes'] = num_classes
         print(f"检测到 {num_classes} 个说话人")
     elif data_root and dataset_type == 'voxceleb':
@@ -396,6 +500,7 @@ def main():
             prefetch_factor=data_config.get('prefetch_factor', 1)
         )
         config['num_classes'] = num_classes
+        config_dict.setdefault('model', {})
         config_dict['model']['num_classes'] = num_classes
         print(f"检测到 {num_classes} 个说话人")
     else:
