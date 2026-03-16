@@ -58,6 +58,27 @@ def _parse_extensions(raw_extensions):
     return items if items else None
 
 
+def resolve_checkpoint_dir_by_modality(base_checkpoint_dir, use_video, separate_by_modality=True):
+    """
+    按模态拆分 checkpoint 目录，避免音频/视频训练互相覆盖。
+
+    示例:
+      checkpoints -> checkpoints/audio 或 checkpoints/video
+    """
+    if not base_checkpoint_dir:
+        base_checkpoint_dir = 'checkpoints'
+    if not separate_by_modality:
+        return base_checkpoint_dir
+
+    normalized = os.path.normpath(base_checkpoint_dir)
+    tail = os.path.basename(normalized).lower()
+    if tail in {'audio', 'video'}:
+        return base_checkpoint_dir
+
+    modality_dir = 'video' if use_video else 'audio'
+    return os.path.join(base_checkpoint_dir, modality_dir)
+
+
 def maybe_generate_vox2video_lists(data_config, train_list, val_list):
     """
     可选自动生成 Vox2Video train/val 列表。
@@ -300,7 +321,10 @@ def main():
                 'num_epochs': 100,
                 'lr_step_size': 20,
                 'lr_gamma': 0.5,
-                'checkpoint_dir': 'checkpoints'
+                'checkpoint_dir': 'checkpoints',
+                'freeze_audio_warmup_epochs': 30,
+                'override_lr_on_resume': True,
+                'separate_checkpoints_by_modality': True
             },
             'data': {
                 'seq_length': 16000
@@ -344,6 +368,9 @@ def main():
         'compute_eer': False,
         'eer_max_samples': 2048,
         'empty_cache_each_epoch': True,
+        'freeze_audio_warmup_epochs': 30,
+        'override_lr_on_resume': True,
+        'separate_checkpoints_by_modality': True,
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,
@@ -500,6 +527,7 @@ def main():
             prefetch_factor=data_config.get('prefetch_factor', 1)
         )
         config['num_classes'] = num_classes
+        config['use_video'] = False
         config_dict.setdefault('model', {})
         config_dict['model']['num_classes'] = num_classes
         print(f"检测到 {num_classes} 个说话人")
@@ -513,6 +541,21 @@ def main():
             num_classes=config['num_classes'],
             seq_length=config_dict['data']['seq_length']
         )
+        config['use_video'] = False
+
+    # 根据当前训练模态自动切换 checkpoint 目录，避免音频与视频训练互相覆盖
+    base_checkpoint_dir = config.get('checkpoint_dir', 'checkpoints')
+    separate_checkpoints = bool(config.get('separate_checkpoints_by_modality', True))
+    resolved_checkpoint_dir = resolve_checkpoint_dir_by_modality(
+        base_checkpoint_dir=base_checkpoint_dir,
+        use_video=bool(config.get('use_video', False)),
+        separate_by_modality=separate_checkpoints
+    )
+    config['checkpoint_dir'] = resolved_checkpoint_dir
+    config_dict.setdefault('training', {})
+    config_dict['training']['checkpoint_dir'] = resolved_checkpoint_dir
+    modality_label = "视频" if config.get('use_video', False) else "音频"
+    print(f"当前为{modality_label}训练，检查点保存目录: {resolved_checkpoint_dir}")
     
     # 创建训练器（使用更新后的配置）
     print("初始化模型和训练器...")

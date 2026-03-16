@@ -57,6 +57,13 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.config.setdefault('checkpoint_dir', 'checkpoints')
+        self.config.setdefault('separate_checkpoints_by_modality', True)
+        self.config['checkpoint_dir'] = self._resolve_checkpoint_dir_by_modality(
+            base_checkpoint_dir=self.config.get('checkpoint_dir', 'checkpoints'),
+            use_video=bool(self.config.get('use_video', False)),
+            separate_by_modality=bool(self.config.get('separate_checkpoints_by_modality', True)),
+        )
         self.model_grad_clip_norm = config.get('model_grad_clip_norm', 1.0)
         self.criterion_grad_clip_norm = config.get('criterion_grad_clip_norm', 1.0)
         self.skip_non_finite_batches = config.get('skip_non_finite_batches', True)
@@ -146,6 +153,26 @@ class Trainer:
         self.lambda_modal_align = float(config.get('lambda_modal_align', 0.0))
         if config.get('use_video', False) and self.lambda_modal_align > 0:
             print(f"启用跨模态对齐损失: lambda_modal_align={self.lambda_modal_align:.4f}")
+
+        raw_warmup_epochs = config.get(
+            'freeze_audio_warmup_epochs',
+            30 if config.get('use_video', False) else 0
+        )
+        try:
+            self.freeze_audio_warmup_epochs = max(0, int(raw_warmup_epochs))
+        except (TypeError, ValueError):
+            print(f"警告: freeze_audio_warmup_epochs={raw_warmup_epochs} 无效，已回退为 30")
+            self.freeze_audio_warmup_epochs = 30 if config.get('use_video', False) else 0
+        self.enable_audio_freeze_warmup = bool(
+            config.get('use_video', False) and self.freeze_audio_warmup_epochs > 0
+        )
+        self.audio_branch_frozen = False
+        self.override_lr_on_resume = bool(config.get('override_lr_on_resume', True))
+        if self.enable_audio_freeze_warmup:
+            print(
+                f"启用音频分支冻结预热: 前 {self.freeze_audio_warmup_epochs} 轮"
+                "仅训练视频与融合模块"
+            )
         
         # 训练历史
         self.train_history = {
@@ -154,6 +181,21 @@ class Trainer:
             'intra_loss': [],
             'modal_align_loss': [],
         }
+
+    @staticmethod
+    def _resolve_checkpoint_dir_by_modality(base_checkpoint_dir, use_video, separate_by_modality=True):
+        if not base_checkpoint_dir:
+            base_checkpoint_dir = 'checkpoints'
+        if not separate_by_modality:
+            return base_checkpoint_dir
+
+        normalized = os.path.normpath(base_checkpoint_dir)
+        tail = os.path.basename(normalized).lower()
+        if tail in {'audio', 'video'}:
+            return base_checkpoint_dir
+
+        modality_dir = 'video' if use_video else 'audio'
+        return os.path.join(base_checkpoint_dir, modality_dir)
 
     def _load_state_dict_flexible(self, state_dict):
         """
@@ -226,6 +268,68 @@ class Trainer:
         if torch.cuda.is_available() and self.empty_cache_each_epoch:
             torch.cuda.empty_cache()
 
+    def _base_model(self):
+        """兼容 torch.compile 返回的包装模型。"""
+        return self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+
+    def _iter_audio_branch_modules(self):
+        model = self._base_model()
+        module_names = (
+            'multi_scale_frontend',
+            'conv_layers',
+            'attention_fusion',
+            'feature_fusion',
+            'embedding_layers',
+        )
+        modules = []
+        for name in module_names:
+            module = getattr(model, name, None)
+            if module is not None:
+                modules.append(module)
+        return modules
+
+    def _set_audio_branch_trainable(self, trainable):
+        for module in self._iter_audio_branch_modules():
+            module.requires_grad_(trainable)
+            if trainable:
+                module.train()
+            else:
+                module.eval()
+        self.audio_branch_frozen = not trainable
+
+    def _sync_audio_branch_mode(self):
+        """模型整体切到 train() 后，保持冻结分支为 eval()。"""
+        if not self.audio_branch_frozen:
+            return
+        for module in self._iter_audio_branch_modules():
+            module.eval()
+
+    def _update_audio_branch_freeze_state(self, epoch):
+        if not self.enable_audio_freeze_warmup:
+            return
+
+        should_freeze = epoch < self.freeze_audio_warmup_epochs
+        if should_freeze and not self.audio_branch_frozen:
+            self._set_audio_branch_trainable(False)
+            print(
+                f"第 {epoch + 1} 轮启用音频分支冻结（共 {self.freeze_audio_warmup_epochs} 轮），"
+                "优先训练视频与融合模块"
+            )
+        elif (not should_freeze) and self.audio_branch_frozen:
+            self._set_audio_branch_trainable(True)
+            print(f"第 {epoch + 1} 轮开始解冻音频分支，进入全模型联合微调")
+
+    def _apply_learning_rate(self, learning_rate):
+        target_lr = float(learning_rate)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = target_lr
+            param_group['initial_lr'] = target_lr
+
+        if hasattr(self.scheduler, 'base_lrs'):
+            self.scheduler.base_lrs = [target_lr for _ in self.optimizer.param_groups]
+        if hasattr(self.scheduler, '_last_lr'):
+            self.scheduler._last_lr = [target_lr for _ in self.optimizer.param_groups]
+
     def _clip_gradients(self):
         """分别裁剪模型与损失头的梯度，避免 ArcFace 分类头后期发散"""
         model_grad_norm = None
@@ -255,6 +359,7 @@ class Trainer:
     def train_epoch(self, dataloader):
         """训练一个epoch，支持梯度累积"""
         self.model.train()
+        self._sync_audio_branch_mode()
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
@@ -548,6 +653,13 @@ class Trainer:
                 {'loss': [], 'am_loss': [], 'intra_loss': [], 'modal_align_loss': []}
             )
             self.train_history.setdefault('modal_align_loss', [])
+            if self.override_lr_on_resume:
+                try:
+                    target_lr = float(self.config['learning_rate'])
+                    self._apply_learning_rate(target_lr)
+                    print(f"恢复训练后已按配置重置学习率: {target_lr:.6f}")
+                except (TypeError, ValueError):
+                    print(f"警告: learning_rate={self.config.get('learning_rate')} 无效，保持检查点中的学习率")
             print(f"从第 {start_epoch} 轮继续训练（已完成 {checkpoint['epoch']} 轮）")
             if 'best_val_loss' in checkpoint:
                 print(f"当前最佳验证损失: {best_val_loss:.4f}")
@@ -559,6 +671,7 @@ class Trainer:
         for epoch in range(start_epoch, num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
             print("-" * 50)
+            self._update_audio_branch_freeze_state(epoch)
             
             # 训练
             train_loss, train_am_loss, train_intra_loss, train_modal_align_loss = self.train_epoch(train_loader)

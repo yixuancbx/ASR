@@ -27,7 +27,7 @@
   },
   "training": {
     "batch_size": 4,
-    "learning_rate": 5e-05,
+    "learning_rate": 3e-05,
     "weight_decay": 1e-05,
     "num_epochs": 100,
     "lr_step_size": 20,
@@ -47,7 +47,9 @@
     "scheduler": "cosine",
     "cosine_T0": 10,
     "cosine_Tmult": 2,
-    "lambda_modal_align": 0.05
+    "lambda_modal_align": 0.05,
+    "freeze_audio_warmup_epochs": 30,
+    "override_lr_on_resume": true
   },
   "data": {
     "dataset_type": "vox2video",
