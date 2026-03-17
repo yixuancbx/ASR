@@ -161,6 +161,7 @@ class CrossModalAdaptiveFusion(nn.Module):
     1) 质量评估分支估计音频/视频可靠性
     2) 特征门控分支对两种模态逐维加权
     3) 融合后再映射到统一说话人嵌入空间
+    4) 增加音频残差旁路，降低训练初期随机融合带来的破坏
     """
 
     def __init__(self, embedding_dim=256, dropout=0.1, modality_dropout=0.0, num_heads=4):
@@ -215,6 +216,16 @@ class CrossModalAdaptiveFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embedding_dim, embedding_dim),
         )
+        self.audio_bypass_head = nn.Sequential(
+            nn.Linear(embedding_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        # 偏置初始化为正值，使训练初期更偏向音频直通，避免随机融合扰动。
+        self.audio_bypass_bias = nn.Parameter(torch.tensor(2.0))
+        self.min_audio_bypass = 0.25
+        self.max_audio_bypass = 0.98
 
     @staticmethod
     def _resolve_num_heads(embedding_dim, num_heads):
@@ -255,7 +266,19 @@ class CrossModalAdaptiveFusion(nn.Module):
         gates = self.gate_head(gate_inputs)
         gated_fused = gates * audio_ctx + (1.0 - gates) * video_ctx
 
-        fused = self.output_head(quality_fused + gated_fused + 0.5 * (audio_ctx + video_ctx))
+        fusion_core = self.output_head(quality_fused + gated_fused + 0.5 * (audio_ctx + video_ctx))
+
+        # 音频残差旁路：训练初期默认更信任音频，随着视频质量提升再放开融合占比。
+        bypass_inputs = torch.cat([audio_embedding, audio_ctx, video_ctx], dim=1)
+        dynamic_bypass = torch.sigmoid(self.audio_bypass_head(bypass_inputs) + self.audio_bypass_bias)
+        quality_bypass = quality_weights[:, :1]
+        bypass_ratio = 0.7 * dynamic_bypass + 0.3 * quality_bypass
+        bypass_ratio = torch.clamp(
+            bypass_ratio,
+            min=self.min_audio_bypass,
+            max=self.max_audio_bypass
+        )
+        fused = bypass_ratio * audio_embedding + (1.0 - bypass_ratio) * fusion_core
         return F.normalize(fused, p=2, dim=1)
 
 
