@@ -215,6 +215,64 @@ class Trainer:
             print(f"跳过因shape不匹配的参数: {skipped}")
         return missing, unexpected, skipped
 
+    @staticmethod
+    def _extract_model_state_dict_from_checkpoint(checkpoint_obj):
+        """兼容两类 checkpoint：完整训练状态字典或纯 model.state_dict()."""
+        if not isinstance(checkpoint_obj, dict):
+            return None
+        if 'model_state_dict' in checkpoint_obj and isinstance(checkpoint_obj['model_state_dict'], dict):
+            return checkpoint_obj['model_state_dict']
+        if checkpoint_obj and all(torch.is_tensor(v) for v in checkpoint_obj.values()):
+            return checkpoint_obj
+        return None
+
+    @staticmethod
+    def _strip_state_dict_prefix(state_dict, prefix):
+        if not prefix or not state_dict:
+            return state_dict
+        if all(k.startswith(prefix) for k in state_dict.keys()):
+            return {k[len(prefix):]: v for k, v in state_dict.items()}
+        return state_dict
+
+    def _count_compatible_params(self, state_dict):
+        current = self.model.state_dict()
+        return sum(
+            1 for k, v in state_dict.items()
+            if k in current and current[k].shape == v.shape
+        )
+
+    def load_pretrained_model_weights(self, checkpoint_path):
+        """
+        仅加载模型参数，不恢复优化器/调度器/epoch。
+        适用于“音频预训练初始化 -> 视频从第0轮训练”。
+        """
+        checkpoint_obj = torch.load(checkpoint_path, map_location=self.device)
+        raw_state_dict = self._extract_model_state_dict_from_checkpoint(checkpoint_obj)
+        if raw_state_dict is None:
+            raise ValueError(f"无法从检查点解析模型参数: {checkpoint_path}")
+
+        candidate_state_dicts = [
+            raw_state_dict,
+            self._strip_state_dict_prefix(raw_state_dict, 'module.'),
+            self._strip_state_dict_prefix(raw_state_dict, '_orig_mod.'),
+            self._strip_state_dict_prefix(
+                self._strip_state_dict_prefix(raw_state_dict, 'module.'),
+                '_orig_mod.'
+            ),
+        ]
+        best_state_dict = max(candidate_state_dicts, key=self._count_compatible_params)
+        matched_count = self._count_compatible_params(best_state_dict)
+        missing, unexpected, skipped = self._load_state_dict_flexible(best_state_dict)
+
+        print(f"已加载预训练模型参数: {checkpoint_path}")
+        print(f"匹配加载参数数量: {matched_count}")
+        if missing:
+            print(f"预训练加载提示: 当前模型缺少参数 {missing}")
+        if unexpected:
+            print(f"预训练加载提示: 检查点含多余参数 {unexpected}")
+        if skipped:
+            print(f"预训练加载提示: 跳过shape不匹配参数 {skipped}")
+
     def _prepare_batch(self, batch):
         """兼容音频单模态与音视频多模态批次格式"""
         if isinstance(batch, dict):
@@ -610,7 +668,7 @@ class Trainer:
         eer = (fpr[min_idx] + fnr[min_idx]) / 2
         return eer.item()
     
-    def train(self, train_loader, val_loader=None, num_epochs=100, resume_from=None):
+    def train(self, train_loader, val_loader=None, num_epochs=100, resume_from=None, pretrained_model_path=None):
         """
         完整训练流程
         
@@ -619,6 +677,7 @@ class Trainer:
             val_loader: 验证数据加载器
             num_epochs: 总训练轮数
             resume_from: 从指定checkpoint恢复（如果为None，会自动查找latest_checkpoint.pth）
+            pretrained_model_path: 仅加载模型参数的预训练权重路径（不恢复优化器和epoch）
         """
         # 尝试恢复训练
         start_epoch = 0
@@ -663,6 +722,15 @@ class Trainer:
             print(f"从第 {start_epoch} 轮继续训练（已完成 {checkpoint['epoch']} 轮）")
             if 'best_val_loss' in checkpoint:
                 print(f"当前最佳验证损失: {best_val_loss:.4f}")
+        elif resume_from:
+            print(f"警告: 指定恢复检查点不存在，忽略 resume_from: {resume_from}")
+
+        if start_epoch == 0 and pretrained_model_path:
+            if os.path.exists(pretrained_model_path):
+                self.load_pretrained_model_weights(pretrained_model_path)
+                print("已基于预训练参数从第0轮开始训练（未恢复优化器和epoch）")
+            else:
+                print(f"警告: 预训练模型不存在，忽略 pretrained_model_path: {pretrained_model_path}")
         
         # 获取保存间隔
         save_interval = self.config.get('save_interval', 10)

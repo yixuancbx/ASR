@@ -79,6 +79,42 @@ def resolve_checkpoint_dir_by_modality(base_checkpoint_dir, use_video, separate_
     return os.path.join(base_checkpoint_dir, modality_dir)
 
 
+def resolve_pretrained_audio_checkpoint(training_config, base_checkpoint_dir):
+    """
+    解析可用的音频预训练权重路径（仅用于视频训练初始化）。
+    优先级:
+      1) training.pretrained_audio_checkpoint（显式配置）
+      2) {base_checkpoint_dir}/audio/best_model.pth
+      3) {base_checkpoint_dir}/audio/latest_checkpoint.pth
+      4) {base_checkpoint_dir}/best_model.pth（兼容旧目录）
+      5) {base_checkpoint_dir}/latest_checkpoint.pth（兼容旧目录）
+    """
+    configured_path = training_config.get('pretrained_audio_checkpoint', None)
+    candidates = []
+
+    if configured_path:
+        candidates.append(configured_path)
+        if not os.path.isabs(configured_path):
+            candidates.append(os.path.join(base_checkpoint_dir, configured_path))
+
+    candidates.extend([
+        os.path.join(base_checkpoint_dir, 'audio', 'best_model.pth'),
+        os.path.join(base_checkpoint_dir, 'audio', 'latest_checkpoint.pth'),
+        os.path.join(base_checkpoint_dir, 'best_model.pth'),
+        os.path.join(base_checkpoint_dir, 'latest_checkpoint.pth'),
+    ])
+
+    visited = set()
+    for path in candidates:
+        norm_path = os.path.normpath(path)
+        if norm_path in visited:
+            continue
+        visited.add(norm_path)
+        if os.path.exists(norm_path):
+            return norm_path
+    return None
+
+
 def maybe_generate_vox2video_lists(data_config, train_list, val_list):
     """
     可选自动生成 Vox2Video train/val 列表。
@@ -324,7 +360,8 @@ def main():
                 'checkpoint_dir': 'checkpoints',
                 'freeze_audio_warmup_epochs': 30,
                 'override_lr_on_resume': True,
-                'separate_checkpoints_by_modality': True
+                'separate_checkpoints_by_modality': True,
+                'pretrained_audio_checkpoint': None
             },
             'data': {
                 'seq_length': 16000
@@ -371,6 +408,7 @@ def main():
         'freeze_audio_warmup_epochs': 30,
         'override_lr_on_resume': True,
         'separate_checkpoints_by_modality': True,
+        'pretrained_audio_checkpoint': None,
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,
@@ -571,12 +609,14 @@ def main():
     # 检查是否要从checkpoint恢复
     checkpoint_dir = config.get('checkpoint_dir', 'checkpoints')
     resume_checkpoint = config_dict['training'].get('resume_from', None)
+    pretrained_model_path = None
     
     if resume_checkpoint:
         checkpoint_path = resume_checkpoint
         if not os.path.isabs(checkpoint_path):
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint_path)
         if os.path.exists(checkpoint_path):
+            resume_checkpoint = checkpoint_path
             print(f"\n从指定checkpoint恢复: {checkpoint_path}")
         else:
             print(f"\n警告: 指定的checkpoint不存在: {checkpoint_path}")
@@ -595,10 +635,33 @@ def main():
             else:
                 print("将从头开始训练...")
                 resume_checkpoint = None
+
+    # 视频训练且无可恢复checkpoint时，自动加载音频预训练参数初始化模型
+    if resume_checkpoint is None and config.get('use_video', False):
+        training_cfg = config_dict.get('training', {})
+        pretrained_model_path = resolve_pretrained_audio_checkpoint(
+            training_config=training_cfg,
+            base_checkpoint_dir=base_checkpoint_dir
+        )
+        configured_pretrained = training_cfg.get('pretrained_audio_checkpoint', None)
+        if pretrained_model_path:
+            print(f"未找到视频checkpoint，改为加载音频预训练参数: {pretrained_model_path}")
+            print("说明: 仅加载模型参数，不恢复优化器和训练轮次")
+        elif configured_pretrained:
+            print(f"警告: 配置的 pretrained_audio_checkpoint 不存在: {configured_pretrained}")
+            print("将从随机初始化开始视频训练")
+        else:
+            print("未找到可用音频预训练权重，将从随机初始化开始视频训练")
     
     # 开始训练
     print("\n开始训练...")
-    trainer.train(train_loader, val_loader, num_epochs=config['num_epochs'], resume_from=resume_checkpoint)
+    trainer.train(
+        train_loader,
+        val_loader,
+        num_epochs=config['num_epochs'],
+        resume_from=resume_checkpoint,
+        pretrained_model_path=pretrained_model_path
+    )
     
     print("\n训练完成！")
 

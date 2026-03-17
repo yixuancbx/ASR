@@ -49,7 +49,9 @@
     "cosine_Tmult": 2,
     "lambda_modal_align": 0.05,
     "freeze_audio_warmup_epochs": 30,
-    "override_lr_on_resume": true
+    "override_lr_on_resume": true,
+    "separate_checkpoints_by_modality": true,
+    "pretrained_audio_checkpoint": "checkpoints/best_model.pth"
   },
   "data": {
     "dataset_type": "vox2video",
