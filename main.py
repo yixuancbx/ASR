@@ -361,7 +361,9 @@ def main():
                 'freeze_audio_warmup_epochs': 30,
                 'override_lr_on_resume': True,
                 'separate_checkpoints_by_modality': True,
-                'pretrained_audio_checkpoint': None
+                'pretrained_audio_checkpoint': None,
+                'enable_data_health_monitor': True,
+                'health_zero_eps': 1e-6
             },
             'data': {
                 'seq_length': 16000
@@ -409,6 +411,8 @@ def main():
         'override_lr_on_resume': True,
         'separate_checkpoints_by_modality': True,
         'pretrained_audio_checkpoint': None,
+        'enable_data_health_monitor': True,
+        'health_zero_eps': 1e-6,
         'use_video': False,
         'video_in_channels': 3,
         'video_channels': 32,

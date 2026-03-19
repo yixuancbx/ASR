@@ -23,7 +23,7 @@
     "am_margin": 0.3,
     "am_scale": 30.0,
     "intra_margin": 0.5,
-    "lambda_intra": 0.05
+    "lambda_intra": 0.0
   },
   "training": {
     "batch_size": 4,
@@ -51,7 +51,9 @@
     "freeze_audio_warmup_epochs": 30,
     "override_lr_on_resume": true,
     "separate_checkpoints_by_modality": true,
-    "pretrained_audio_checkpoint": "checkpoints/best_model.pth"
+    "pretrained_audio_checkpoint": "checkpoints/best_model.pth",
+    "enable_data_health_monitor": true,
+    "health_zero_eps": 1e-06
   },
   "data": {
     "dataset_type": "vox2video",

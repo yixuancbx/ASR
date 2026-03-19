@@ -124,6 +124,7 @@ class Trainer:
             lr=config['learning_rate'],
             weight_decay=config['weight_decay']
         )
+        self._audit_optimizer_parameter_coverage()
         
         # 学习率调度器（默认余弦退火重启，可回退到StepLR）
         if self.config.get('scheduler', 'cosine') == 'cosine':
@@ -168,11 +169,22 @@ class Trainer:
         )
         self.audio_branch_frozen = False
         self.override_lr_on_resume = bool(config.get('override_lr_on_resume', True))
+        self.enable_data_health_monitor = bool(
+            config.get('enable_data_health_monitor', config.get('use_video', False))
+        )
+        try:
+            self.health_zero_eps = float(config.get('health_zero_eps', 1e-6))
+        except (TypeError, ValueError):
+            self.health_zero_eps = 1e-6
+        self.latest_train_health_stats = None
+        self.latest_val_health_stats = None
         if self.enable_audio_freeze_warmup:
             print(
                 f"启用音频分支冻结预热: 前 {self.freeze_audio_warmup_epochs} 轮"
                 "仅训练视频与融合模块"
             )
+        if self.enable_data_health_monitor:
+            print(f"启用数据健康监控: zero_eps={self.health_zero_eps:g}")
         
         # 训练历史
         self.train_history = {
@@ -241,6 +253,128 @@ class Trainer:
             if k in current and current[k].shape == v.shape
         )
 
+    def _audit_optimizer_parameter_coverage(self):
+        """检查模型与损失头参数是否都已纳入优化器。"""
+        optimizer_param_ids = {
+            id(param)
+            for group in self.optimizer.param_groups
+            for param in group['params']
+        }
+        model_trainable = [p for p in self.model_parameters if p.requires_grad]
+        criterion_trainable = [p for p in self.criterion_parameters if p.requires_grad]
+
+        missing_model = sum(1 for p in model_trainable if id(p) not in optimizer_param_ids)
+        missing_criterion = sum(1 for p in criterion_trainable if id(p) not in optimizer_param_ids)
+
+        if missing_model > 0 or missing_criterion > 0:
+            print(
+                "警告: 优化器参数覆盖不完整，"
+                f"模型遗漏 {missing_model} 个，损失头遗漏 {missing_criterion} 个"
+            )
+            if missing_criterion > 0:
+                print("警告: ArcFace/AAM-Softmax 分类头可能未被优化，请检查参数组构建")
+        else:
+            print(
+                "优化器参数校验通过: "
+                f"模型参数 {len(model_trainable)} 个，损失头参数 {len(criterion_trainable)} 个均已纳入优化器"
+            )
+
+    def _init_health_stats(self):
+        return {
+            'samples': 0,
+            'audio_zero': 0,
+            'video_zero': 0,
+            'audio_effective_sum': 0,
+            'audio_effective_count': 0,
+            'audio_effective_min': None,
+            'audio_effective_max': 0,
+            'audio_fallback_sum': 0,
+            'audio_fallback_count': 0,
+            'video_fallback_sum': 0,
+            'video_fallback_count': 0,
+            'audio_tensor_len': 0,
+        }
+
+    def _update_health_stats(self, health_stats, audio, video, batch_meta):
+        if health_stats is None:
+            return
+
+        batch_size = int(audio.size(0))
+        health_stats['samples'] += batch_size
+        if health_stats['audio_tensor_len'] <= 0:
+            health_stats['audio_tensor_len'] = int(audio.size(-1))
+
+        audio_energy = audio.detach().abs().sum(dim=(1, 2))
+        health_stats['audio_zero'] += int((audio_energy <= self.health_zero_eps).sum().item())
+
+        if video is not None:
+            video_energy = video.detach().abs().sum(dim=(1, 2, 3, 4))
+            health_stats['video_zero'] += int((video_energy <= self.health_zero_eps).sum().item())
+
+        effective_samples = batch_meta.get('audio_effective_samples')
+        if effective_samples is not None:
+            effective_samples = effective_samples.view(-1).long()
+            if effective_samples.numel() > 0:
+                health_stats['audio_effective_sum'] += int(effective_samples.sum().item())
+                health_stats['audio_effective_count'] += int(effective_samples.numel())
+                current_min = int(effective_samples.min().item())
+                current_max = int(effective_samples.max().item())
+                if (
+                    health_stats['audio_effective_min'] is None
+                    or current_min < health_stats['audio_effective_min']
+                ):
+                    health_stats['audio_effective_min'] = current_min
+                if current_max > health_stats['audio_effective_max']:
+                    health_stats['audio_effective_max'] = current_max
+
+        audio_fallback = batch_meta.get('audio_fallback_used')
+        if audio_fallback is not None:
+            audio_fallback = audio_fallback.view(-1).long()
+            health_stats['audio_fallback_sum'] += int(audio_fallback.sum().item())
+            health_stats['audio_fallback_count'] += int(audio_fallback.numel())
+
+        video_fallback = batch_meta.get('video_fallback_used')
+        if video_fallback is not None:
+            video_fallback = video_fallback.view(-1).long()
+            health_stats['video_fallback_sum'] += int(video_fallback.sum().item())
+            health_stats['video_fallback_count'] += int(video_fallback.numel())
+
+    def _format_health_stats(self, health_stats, stage='train'):
+        if not health_stats or health_stats.get('samples', 0) <= 0:
+            return f"数据健康监控[{stage}]：无有效样本"
+
+        samples = max(1, int(health_stats['samples']))
+        audio_zero_ratio = health_stats['audio_zero'] / samples
+        video_zero_ratio = health_stats['video_zero'] / samples
+
+        parts = [
+            f"audio_zero={audio_zero_ratio:.2%}",
+            f"video_zero={video_zero_ratio:.2%}",
+        ]
+
+        if health_stats['audio_effective_count'] > 0:
+            avg_effective = health_stats['audio_effective_sum'] / health_stats['audio_effective_count']
+            min_effective = health_stats['audio_effective_min']
+            max_effective = health_stats['audio_effective_max']
+            tensor_len = max(1, int(health_stats.get('audio_tensor_len', 0)))
+            parts.append(
+                "audio_effective(avg/min/max)="
+                f"{avg_effective:.1f}/{min_effective}/{max_effective}"
+                f" ({(avg_effective / tensor_len):.1%} of segment)"
+            )
+
+        if health_stats['audio_fallback_count'] > 0:
+            parts.append(
+                f"audio_fallback={health_stats['audio_fallback_sum'] / health_stats['audio_fallback_count']:.2%}"
+            )
+
+        if health_stats['video_fallback_count'] > 0:
+            parts.append(
+                f"video_fallback={health_stats['video_fallback_sum'] / health_stats['video_fallback_count']:.2%}"
+            )
+
+        return f"数据健康监控[{stage}]：{', '.join(parts)}"
+
     def load_pretrained_model_weights(self, checkpoint_path):
         """
         仅加载模型参数，不恢复优化器/调度器/epoch。
@@ -281,12 +415,21 @@ class Trainer:
             video = batch.get('video')
             if video is not None:
                 video = video.to(self.device, non_blocking=True)
-            return audio, video, labels
+            batch_meta = {}
+            for key in ('audio_effective_samples', 'audio_fallback_used', 'video_fallback_used'):
+                if key not in batch:
+                    continue
+                value = batch[key]
+                if isinstance(value, torch.Tensor):
+                    batch_meta[key] = value.detach().cpu().view(-1)
+                else:
+                    batch_meta[key] = torch.as_tensor(value).view(-1)
+            return audio, video, labels, batch_meta
 
         audio, labels = batch
         audio = audio.to(self.device, non_blocking=True)
         labels = labels.to(self.device, non_blocking=True)
-        return audio, None, labels
+        return audio, None, labels, {}
 
     def _forward_and_compute_loss(self, audio, video, labels):
         need_modal_outputs = (
@@ -418,6 +561,7 @@ class Trainer:
         """训练一个epoch，支持梯度累积"""
         self.model.train()
         self._sync_audio_branch_mode()
+        health_stats = self._init_health_stats() if self.enable_data_health_monitor else None
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
@@ -435,7 +579,8 @@ class Trainer:
             if max_batches is not None and batch_idx >= max_batches:
                 break
             
-            audio, video, labels = self._prepare_batch(batch)
+            audio, video, labels, batch_meta = self._prepare_batch(batch)
+            self._update_health_stats(health_stats, audio, video, batch_meta)
             
             # 使用混合精度训练
             if self.use_amp:
@@ -446,7 +591,7 @@ class Trainer:
                     print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
                     self.optimizer.zero_grad(set_to_none=True)
                     pending_grad = False
-                    del audio, labels, embeddings, loss, batch
+                    del audio, labels, embeddings, loss, batch, batch_meta
                     if video is not None:
                         del video
                     continue
@@ -480,7 +625,7 @@ class Trainer:
                     print(f"警告: 第 {batch_idx} 个 batch 出现非有限损失，已跳过")
                     self.optimizer.zero_grad(set_to_none=True)
                     pending_grad = False
-                    del audio, labels, embeddings, loss, batch
+                    del audio, labels, embeddings, loss, batch, batch_meta
                     if video is not None:
                         del video
                     continue
@@ -532,7 +677,7 @@ class Trainer:
             if batch_idx % 200 == 0:
                 gc.collect()
 
-            del audio, labels, embeddings, loss, batch
+            del audio, labels, embeddings, loss, batch, batch_meta
             if video is not None:
                 del video
         
@@ -571,12 +716,14 @@ class Trainer:
         avg_am_loss = total_am_loss / processed_batches
         avg_intra_loss = total_intra_loss / processed_batches
         avg_modal_align_loss = total_modal_align_loss / processed_batches
+        self.latest_train_health_stats = health_stats
         
         return avg_loss, avg_am_loss, avg_intra_loss, avg_modal_align_loss
     
     def validate(self, dataloader):
         """验证，增加 EER 度量"""
         self.model.eval()
+        health_stats = self._init_health_stats() if self.enable_data_health_monitor else None
         total_loss = 0.0
         total_am_loss = 0.0
         total_intra_loss = 0.0
@@ -592,7 +739,8 @@ class Trainer:
                 if max_batches is not None and batch_idx >= max_batches:
                     break
                 
-                audio, video, labels = self._prepare_batch(batch)
+                audio, video, labels, batch_meta = self._prepare_batch(batch)
+                self._update_health_stats(health_stats, audio, video, batch_meta)
                 
                 # 使用混合精度（推理时也可以加速）
                 if self.use_amp:
@@ -614,7 +762,7 @@ class Trainer:
                     stored_samples += min(remaining, embeddings.size(0))
                 
                 # 清理中间变量
-                del audio, labels, embeddings, loss, batch
+                del audio, labels, embeddings, loss, batch, batch_meta
                 if video is not None:
                     del video
                 if batch_idx % 50 == 0:
@@ -628,6 +776,7 @@ class Trainer:
         avg_intra_loss = total_intra_loss / processed_batches
         avg_modal_align_loss = total_modal_align_loss / processed_batches
         eer = self.compute_eer(all_embeddings, all_labels) if self.compute_eer_enabled else None
+        self.latest_val_health_stats = health_stats
 
         del all_embeddings, all_labels
         self._maybe_release_memory()
@@ -705,6 +854,11 @@ class Trainer:
             if skipped:
                 print(f"加载检查点: 跳过shape不匹配参数 {skipped}")
 
+            if 'criterion_state_dict' in checkpoint:
+                self.criterion.load_state_dict(checkpoint['criterion_state_dict'])
+            else:
+                print("警告: 检查点不包含 criterion_state_dict，ArcFace 分类头将使用当前初始化权重")
+
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.train_history = checkpoint.get(
@@ -757,6 +911,8 @@ class Trainer:
                 )
             else:
                 print(f"训练损失: {train_loss:.4f} (AM: {train_am_loss:.4f}, Intra: {train_intra_loss:.4f})")
+            if self.enable_data_health_monitor and self.latest_train_health_stats is not None:
+                print(self._format_health_stats(self.latest_train_health_stats, stage='train'))
             
             # 验证
             should_validate = val_loader is not None and ((epoch + 1) % val_interval == 0 or epoch == num_epochs - 1)
@@ -787,6 +943,8 @@ class Trainer:
                             f"验证损失: {val_loss:.4f} "
                             f"(AM: {val_am_loss:.4f}, Intra: {val_intra_loss:.4f}), EER: {eer_msg}"
                         )
+                if self.enable_data_health_monitor and self.latest_val_health_stats is not None:
+                    print(self._format_health_stats(self.latest_val_health_stats, stage='val'))
                 
                 # 保存最佳模型
                 if val_loss < best_val_loss:
@@ -828,6 +986,7 @@ class Trainer:
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
+            'criterion_state_dict': self.criterion.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_history': self.train_history,
@@ -867,6 +1026,11 @@ class Trainer:
             print(f"加载检查点: 多余参数 {unexpected}")
         if skipped:
             print(f"加载检查点: 跳过shape不匹配参数 {skipped}")
+
+        if 'criterion_state_dict' in checkpoint:
+            self.criterion.load_state_dict(checkpoint['criterion_state_dict'])
+        else:
+            print("警告: 检查点不包含 criterion_state_dict，ArcFace 分类头将使用当前初始化权重")
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
