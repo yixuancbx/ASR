@@ -363,7 +363,9 @@ def main():
                 'separate_checkpoints_by_modality': True,
                 'pretrained_audio_checkpoint': None,
                 'enable_data_health_monitor': True,
-                'health_zero_eps': 1e-6
+                'health_zero_eps': 1e-6,
+                'eer_pair_block_size': 512,
+                'eer_max_pairs': 1500000,
             },
             'data': {
                 'seq_length': 16000
@@ -406,6 +408,8 @@ def main():
         'val_interval': 1,
         'compute_eer': False,
         'eer_max_samples': 2048,
+        'eer_pair_block_size': 512,
+        'eer_max_pairs': 1500000,
         'empty_cache_each_epoch': True,
         'freeze_audio_warmup_epochs': 30,
         'override_lr_on_resume': True,
@@ -535,6 +539,36 @@ def main():
             loader_kwargs['frame_size'] = data_config.get('video_frame_size', 112)
             loader_kwargs['frame_stride'] = data_config.get('video_frame_stride', 2)
             loader_kwargs['align_av_segment'] = data_config.get('align_av_segment', True)
+            loader_kwargs['decode_window_seconds'] = data_config.get('video_decode_window_sec', None)
+            loader_kwargs['worker_trim_interval'] = data_config.get('worker_trim_interval', 256)
+            loader_kwargs['video_return_float16'] = data_config.get('video_return_float16', True)
+
+            raw_workers = loader_kwargs.get('num_workers', 0)
+            try:
+                raw_workers = max(0, int(raw_workers))
+            except (TypeError, ValueError):
+                print(f"警告: num_workers={loader_kwargs.get('num_workers')} 无效，已回退为 0")
+                raw_workers = 0
+            loader_kwargs['num_workers'] = raw_workers
+
+            raw_max_video_workers = data_config.get('max_video_workers', 2)
+            try:
+                max_video_workers = max(0, int(raw_max_video_workers))
+            except (TypeError, ValueError):
+                print(f"警告: max_video_workers={raw_max_video_workers} 无效，已回退为 2")
+                max_video_workers = 2
+
+            if raw_workers > max_video_workers:
+                print(
+                    f"Vox2Video 内存保护：num_workers 从 {raw_workers} 限制到 {max_video_workers} "
+                    f"(可在 data.max_video_workers 调整)"
+                )
+                loader_kwargs['num_workers'] = max_video_workers
+
+            multiprocessing_context = data_config.get('multiprocessing_context', None)
+            if multiprocessing_context is None and os.name != 'nt' and loader_kwargs['num_workers'] > 0:
+                multiprocessing_context = 'spawn'
+            loader_kwargs['multiprocessing_context'] = multiprocessing_context
 
         train_loader, val_loader, num_classes = dataset_loader(**loader_kwargs)
         # 更新配置中的说话人数量

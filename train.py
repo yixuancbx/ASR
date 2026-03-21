@@ -28,7 +28,9 @@ def _create_dataloader(dataset,
                        drop_last,
                        pin_memory=None,
                        persistent_workers=False,
-                       prefetch_factor=1):
+                       prefetch_factor=1,
+                       multiprocessing_context=None,
+                       worker_init_fn=None):
     """
     统一创建 DataLoader。
     默认使用更保守的 worker/prefetch 配置，降低长时间训练时的内存上涨风险。
@@ -49,6 +51,10 @@ def _create_dataloader(dataset,
         loader_kwargs['persistent_workers'] = persistent_workers
         if prefetch_factor is not None:
             loader_kwargs['prefetch_factor'] = prefetch_factor
+        if multiprocessing_context is not None:
+            loader_kwargs['multiprocessing_context'] = multiprocessing_context
+        if worker_init_fn is not None:
+            loader_kwargs['worker_init_fn'] = worker_init_fn
 
     return DataLoader(**loader_kwargs)
 
@@ -150,6 +156,21 @@ class Trainer:
 
         self.compute_eer_enabled = config.get('compute_eer', False)
         self.eer_max_samples = config.get('eer_max_samples', 2048)
+        raw_eer_block_size = config.get('eer_pair_block_size', 512)
+        try:
+            self.eer_pair_block_size = max(64, int(raw_eer_block_size))
+        except (TypeError, ValueError):
+            self.eer_pair_block_size = 512
+
+        raw_eer_max_pairs = config.get('eer_max_pairs', 1_500_000)
+        try:
+            self.eer_max_pairs = int(raw_eer_max_pairs) if raw_eer_max_pairs is not None else None
+            if self.eer_max_pairs is not None and self.eer_max_pairs <= 0:
+                self.eer_max_pairs = None
+        except (TypeError, ValueError):
+            self.eer_max_pairs = None
+        if self.compute_eer_enabled and self.eer_max_pairs is not None:
+            print(f"EER pair 采样上限: {self.eer_max_pairs}")
         self.empty_cache_each_epoch = config.get('empty_cache_each_epoch', True)
         self.lambda_modal_align = float(config.get('lambda_modal_align', 0.0))
         if config.get('use_video', False) and self.lambda_modal_align > 0:
@@ -414,7 +435,8 @@ class Trainer:
             labels = batch['label'].to(self.device, non_blocking=True)
             video = batch.get('video')
             if video is not None:
-                video = video.to(self.device, non_blocking=True)
+                target_dtype = torch.float16 if self.use_amp else torch.float32
+                video = video.to(self.device, dtype=target_dtype, non_blocking=True)
             batch_meta = {}
             for key in ('audio_effective_samples', 'audio_fallback_used', 'video_fallback_used'):
                 if key not in batch:
@@ -787,28 +809,78 @@ class Trainer:
         """根据验证集嵌入计算 EER（Equal Error Rate）"""
         if len(embedding_chunks) == 0:
             return None
-        embeddings = torch.cat(embedding_chunks, dim=0)
-        labels = torch.cat(label_chunks, dim=0)
+
+        embeddings = torch.cat(embedding_chunks, dim=0).float().cpu()
+        labels = torch.cat(label_chunks, dim=0).long().cpu()
         if embeddings.size(0) < 2:
             return None
-        # 归一化
+
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-        # 余弦相似度矩阵
-        sim = torch.matmul(embeddings, embeddings.t())
-        n = sim.size(0)
-        triu_mask = torch.triu(torch.ones(n, n, device=sim.device, dtype=torch.bool), diagonal=1)
-        scores = sim[triu_mask]
-        pair_labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).to(sim.device)
-        targets = pair_labels[triu_mask].float()
+        n = embeddings.size(0)
+        block_size = max(64, int(self.eer_pair_block_size))
+
+        score_chunks = []
+        target_chunks = []
+        remaining_pairs = self.eer_max_pairs
+        early_stop = False
+        for i in range(0, n, block_size):
+            emb_i = embeddings[i:i + block_size]
+            labels_i = labels[i:i + block_size]
+            for j in range(i, n, block_size):
+                emb_j = embeddings[j:j + block_size]
+                labels_j = labels[j:j + block_size]
+
+                sim_block = torch.matmul(emb_i, emb_j.t())
+                if i == j:
+                    if sim_block.size(0) < 2:
+                        continue
+                    tri_idx = torch.triu_indices(
+                        sim_block.size(0),
+                        sim_block.size(1),
+                        offset=1,
+                        device=sim_block.device
+                    )
+                    block_scores = sim_block[tri_idx[0], tri_idx[1]]
+                    block_targets = (labels_i[tri_idx[0]] == labels_j[tri_idx[1]])
+                else:
+                    block_scores = sim_block.reshape(-1)
+                    block_targets = (labels_i.unsqueeze(1) == labels_j.unsqueeze(0)).reshape(-1)
+
+                if remaining_pairs is not None:
+                    if remaining_pairs <= 0:
+                        early_stop = True
+                        break
+                    if block_scores.numel() > remaining_pairs:
+                        keep_idx = torch.randperm(block_scores.numel(), device=block_scores.device)[:remaining_pairs]
+                        block_scores = block_scores[keep_idx]
+                        block_targets = block_targets[keep_idx]
+                    remaining_pairs -= block_scores.numel()
+
+                score_chunks.append(block_scores.cpu())
+                target_chunks.append(block_targets.cpu())
+            if early_stop:
+                break
+
+        if len(score_chunks) == 0:
+            return None
+
+        scores = torch.cat(score_chunks, dim=0)
+        targets = torch.cat(target_chunks, dim=0).float()
+
         pos_total = targets.sum()
         neg_total = targets.numel() - pos_total
         if pos_total == 0 or neg_total == 0:
             return None
         # 按得分降序排序，累积TP/FP
-        scores_sorted, idx = torch.sort(scores, descending=True)
+        idx = torch.argsort(scores, descending=True)
         targets_sorted = targets[idx]
         tp = targets_sorted.cumsum(0)
-        fp = torch.arange(1, targets_sorted.numel() + 1, device=scores.device) - tp
+        fp = torch.arange(
+            1,
+            targets_sorted.numel() + 1,
+            device=scores.device,
+            dtype=tp.dtype
+        ) - tp
         tpr = tp / pos_total
         fpr = fp / neg_total
         fnr = 1 - tpr
@@ -1253,9 +1325,13 @@ def create_vox2video_dataset_from_list(train_list,
                                        frame_size=112,
                                        frame_stride=2,
                                        align_av_segment=True,
+                                       decode_window_seconds=None,
+                                       worker_trim_interval=256,
+                                       video_return_float16=True,
                                        pin_memory=None,
                                        persistent_workers=False,
-                                       prefetch_factor=1):
+                                       prefetch_factor=1,
+                                       multiprocessing_context=None):
     """从 Vox2Video 的 mp4 列表创建音视频联合训练数据加载器"""
     from dataset import Vox2VideoDatasetFromList
 
@@ -1270,6 +1346,9 @@ def create_vox2video_dataset_from_list(train_list,
         train=True,
         augmentation=augmentation,
         align_av_segment=align_av_segment,
+        decode_window_seconds=decode_window_seconds,
+        worker_trim_interval=worker_trim_interval,
+        video_return_float16=video_return_float16,
     )
 
     val_dataset = Vox2VideoDatasetFromList(
@@ -1285,6 +1364,9 @@ def create_vox2video_dataset_from_list(train_list,
         speaker_to_id=train_dataset.speaker_to_id,
         allow_new_speakers=False,
         align_av_segment=align_av_segment,
+        decode_window_seconds=decode_window_seconds,
+        worker_trim_interval=worker_trim_interval,
+        video_return_float16=video_return_float16,
     )
 
     num_classes = train_dataset.get_num_speakers()
@@ -1297,6 +1379,7 @@ def create_vox2video_dataset_from_list(train_list,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=multiprocessing_context,
         drop_last=True
     )
 
@@ -1308,6 +1391,7 @@ def create_vox2video_dataset_from_list(train_list,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        multiprocessing_context=multiprocessing_context,
         drop_last=False
     )
 
