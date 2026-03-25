@@ -139,9 +139,19 @@ class ChannelAttention(nn.Module):
 
 class MultiLevelDynamicAttentionFusion(nn.Module):
     """多层次动态注意力融合模块"""
-    def __init__(self, in_channels, num_heads=8, reduction=16, dropout=0.1):
+    def __init__(self,
+                 in_channels,
+                 num_heads=8,
+                 reduction=16,
+                 dropout=0.1,
+                 enable_local_attention=True,
+                 enable_global_attention=True,
+                 enable_channel_attention=True):
         super(MultiLevelDynamicAttentionFusion, self).__init__()
         self.in_channels = in_channels
+        self.enable_local_attention = bool(enable_local_attention)
+        self.enable_global_attention = bool(enable_global_attention)
+        self.enable_channel_attention = bool(enable_channel_attention)
         
         # 三个注意力模块
         self.local_attention = LocalFrameAttention(in_channels, reduction=reduction)
@@ -158,19 +168,37 @@ class MultiLevelDynamicAttentionFusion(nn.Module):
         Returns:
             fused_features: [B, C, T] 融合后的特征
         """
-        # 应用三种注意力机制
-        local_feat = self.local_attention(x)      # [B, C, T]
-        global_feat = self.global_attention(x)   # [B, C, T]
-        channel_feat = self.channel_attention(x) # [B, C, T]
-        
-        # 归一化融合权重
-        weights = F.softmax(self.fusion_weights, dim=0)
-        
-        # 加权融合
-        fused_features = (weights[0] * local_feat + 
-                         weights[1] * global_feat + 
-                         weights[2] * channel_feat)
-        
+        enabled_mask = torch.tensor(
+            [
+                self.enable_local_attention,
+                self.enable_global_attention,
+                self.enable_channel_attention,
+            ],
+            device=x.device,
+            dtype=torch.bool
+        )
+
+        # 全部关闭时直接返回输入，用于极限消融
+        if not enabled_mask.any():
+            return x
+
+        # 按开关执行注意力模块，关闭的分支不参与计算
+        local_feat = self.local_attention(x) if self.enable_local_attention else None
+        global_feat = self.global_attention(x) if self.enable_global_attention else None
+        channel_feat = self.channel_attention(x) if self.enable_channel_attention else None
+
+        # 归一化融合权重，仅在启用分支上分配权重
+        masked_logits = self.fusion_weights.masked_fill(~enabled_mask, -1e9)
+        weights = F.softmax(masked_logits, dim=0)
+
+        fused_features = torch.zeros_like(x)
+        if local_feat is not None:
+            fused_features = fused_features + weights[0] * local_feat
+        if global_feat is not None:
+            fused_features = fused_features + weights[1] * global_feat
+        if channel_feat is not None:
+            fused_features = fused_features + weights[2] * channel_feat
+
         return fused_features
 
 

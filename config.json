@@ -56,10 +56,10 @@
     "health_zero_eps": 1e-06
   },
   "data": {
-    "dataset_type": "vox2video",
-    "data_root": "D:\\VPN\\vox2_test_mp4\\mp4",
-    "train_list": "lists/vox2video_train_list.txt",
-    "val_list": "lists/vox2video_val_list.txt",
+    "dataset_type": "voxceleb",
+    "data_root": "D:\\VPN\\wav",
+    "train_list": "subset_lists/train_subset_spk500_min30_seed42.txt",
+    "val_list": "subset_lists/val_subset_spk500_min30_seed42.txt",
     "auto_generate_lists": true,
     "list_output_dir": "lists",
     "list_min_samples_per_speaker": 8,

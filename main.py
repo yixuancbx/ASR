@@ -1,6 +1,7 @@
 """
 基于注意力机制的短语音说话人识别模型 - 主入口
 """
+import argparse
 import torch
 import json
 import os
@@ -322,18 +323,20 @@ def create_speaker_limited_subset_lists(train_list,
     return train_subset_list, val_subset_list
 
 
-def main():
+def main(config_path='config.json', disable_auto_resume=False):
     """主函数"""
     print("=" * 60)
     print("基于注意力机制的短语音说话人识别模型")
     print("=" * 60)
-    
+
+    config_path = config_path or 'config.json'
+
     # 加载配置
     try:
-        with open('config.json', 'r', encoding='utf-8') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config_dict = json.load(f)
     except FileNotFoundError:
-        print("未找到config.json，使用默认配置")
+        print(f"未找到配置文件 {config_path}，使用默认配置")
         config_dict = {
             'model': {
                 'in_channels': 1,
@@ -429,6 +432,9 @@ def main():
         'max_attention_frames': 0,
         'temporal_pool_type': 'avg',
         'use_attention_checkpoint': False,
+        'enable_local_attention': True,
+        'enable_global_attention': True,
+        'enable_channel_attention': True,
     }
     for k, v in defaults.items():
         config.setdefault(k, v)
@@ -453,7 +459,7 @@ def main():
     if train_list and val_list:
         inferred_dataset_type = infer_dataset_type(train_list)
         if dataset_type and inferred_dataset_type and dataset_type != inferred_dataset_type:
-            print(f"警告: config.json 中的 dataset_type={dataset_type}，但列表文件看起来更像 {inferred_dataset_type}")
+            print(f"警告: 配置文件中的 dataset_type={dataset_type}，但列表文件看起来更像 {inferred_dataset_type}")
         dataset_type = dataset_type or inferred_dataset_type
 
         if dataset_type == 'voxceleb':
@@ -661,18 +667,21 @@ def main():
             print("将自动查找最新的checkpoint或从头开始训练")
             resume_checkpoint = None
     else:
-        # 检查是否存在最新的checkpoint
-        latest_checkpoint = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
-        if os.path.exists(latest_checkpoint):
-            print(f"\n发现之前的训练记录: {latest_checkpoint}")
-            # response = input("是否从中断的地方继续训练？(y/n，默认y): ").strip().lower()
-            response = 'y'  # 强制自动从中断处继续训练
-            if response in ['', 'y', 'yes']:
-                resume_checkpoint = latest_checkpoint
-                print("将从检查点继续训练...")
-            else:
-                print("将从头开始训练...")
-                resume_checkpoint = None
+        if disable_auto_resume:
+            print("\n已禁用自动续训检查，将从头开始训练（除非显式设置 resume_from）")
+        else:
+            # 检查是否存在最新的checkpoint
+            latest_checkpoint = os.path.join(checkpoint_dir, 'latest_checkpoint.pth')
+            if os.path.exists(latest_checkpoint):
+                print(f"\n发现之前的训练记录: {latest_checkpoint}")
+                # response = input("是否从中断的地方继续训练？(y/n，默认y): ").strip().lower()
+                response = 'y'  # 强制自动从中断处继续训练
+                if response in ['', 'y', 'yes']:
+                    resume_checkpoint = latest_checkpoint
+                    print("将从检查点继续训练...")
+                else:
+                    print("将从头开始训练...")
+                    resume_checkpoint = None
 
     # 视频训练且无可恢复checkpoint时，自动加载音频预训练参数初始化模型
     if resume_checkpoint is None and config.get('use_video', False):
@@ -693,16 +702,34 @@ def main():
     
     # 开始训练
     print("\n开始训练...")
-    trainer.train(
+    train_summary = trainer.train(
         train_loader,
         val_loader,
         num_epochs=config['num_epochs'],
         resume_from=resume_checkpoint,
         pretrained_model_path=pretrained_model_path
     )
-    
+
     print("\n训练完成！")
+    return train_summary
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description='训练主入口')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config.json',
+        help='训练配置文件路径（默认: config.json）'
+    )
+    parser.add_argument(
+        '--disable_auto_resume',
+        action='store_true',
+        help='禁用自动查找 latest_checkpoint.pth 继续训练'
+    )
+    return parser
 
 
 if __name__ == '__main__':
-    main()
+    args = _build_arg_parser().parse_args()
+    main(config_path=args.config, disable_auto_resume=args.disable_auto_resume)

@@ -94,6 +94,9 @@ class Trainer:
             max_attention_frames=config.get('max_attention_frames', 0),
             temporal_pool_type=config.get('temporal_pool_type', 'avg'),
             use_attention_checkpoint=config.get('use_attention_checkpoint', False),
+            enable_local_attention=config.get('enable_local_attention', True),
+            enable_global_attention=config.get('enable_global_attention', True),
+            enable_channel_attention=config.get('enable_channel_attention', True),
             use_video=config.get('use_video', False),
             video_in_channels=config.get('video_in_channels', 3),
             video_channels=config.get('video_channels', 24),
@@ -213,6 +216,11 @@ class Trainer:
             'am_loss': [],
             'intra_loss': [],
             'modal_align_loss': [],
+            'val_loss': [],
+            'val_am_loss': [],
+            'val_intra_loss': [],
+            'val_modal_align_loss': [],
+            'val_eer': [],
         }
 
     @staticmethod
@@ -899,10 +907,15 @@ class Trainer:
             num_epochs: 总训练轮数
             resume_from: 从指定checkpoint恢复（如果为None，会自动查找latest_checkpoint.pth）
             pretrained_model_path: 仅加载模型参数的预训练权重路径（不恢复优化器和epoch）
+        Returns:
+            dict: 训练摘要（最佳/最后一次验证指标等）
         """
         # 尝试恢复训练
         start_epoch = 0
         best_val_loss = float('inf')
+        best_val_eer = None
+        last_val_loss = None
+        last_val_eer = None
         
         if resume_from is None:
             # 自动查找最新的checkpoint
@@ -935,9 +948,25 @@ class Trainer:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.train_history = checkpoint.get(
                 'train_history',
-                {'loss': [], 'am_loss': [], 'intra_loss': [], 'modal_align_loss': []}
+                {
+                    'loss': [],
+                    'am_loss': [],
+                    'intra_loss': [],
+                    'modal_align_loss': [],
+                    'val_loss': [],
+                    'val_am_loss': [],
+                    'val_intra_loss': [],
+                    'val_modal_align_loss': [],
+                    'val_eer': [],
+                }
             )
             self.train_history.setdefault('modal_align_loss', [])
+            self.train_history.setdefault('val_loss', [])
+            self.train_history.setdefault('val_am_loss', [])
+            self.train_history.setdefault('val_intra_loss', [])
+            self.train_history.setdefault('val_modal_align_loss', [])
+            self.train_history.setdefault('val_eer', [])
+            best_val_eer = checkpoint.get('best_val_eer', None)
             if self.override_lr_on_resume:
                 try:
                     target_lr = float(self.config['learning_rate'])
@@ -948,6 +977,8 @@ class Trainer:
             print(f"从第 {start_epoch} 轮继续训练（已完成 {checkpoint['epoch']} 轮）")
             if 'best_val_loss' in checkpoint:
                 print(f"当前最佳验证损失: {best_val_loss:.4f}")
+            if best_val_eer is not None:
+                print(f"当前最佳验证EER: {best_val_eer:.4f}")
         elif resume_from:
             print(f"警告: 指定恢复检查点不存在，忽略 resume_from: {resume_from}")
 
@@ -990,6 +1021,13 @@ class Trainer:
             should_validate = val_loader is not None and ((epoch + 1) % val_interval == 0 or epoch == num_epochs - 1)
             if should_validate:
                 val_loss, val_am_loss, val_intra_loss, val_modal_align_loss, val_eer = self.validate(val_loader)
+                last_val_loss = val_loss
+                last_val_eer = val_eer
+                self.train_history['val_loss'].append(val_loss)
+                self.train_history['val_am_loss'].append(val_am_loss)
+                self.train_history['val_intra_loss'].append(val_intra_loss)
+                self.train_history['val_modal_align_loss'].append(val_modal_align_loss)
+                self.train_history['val_eer'].append(val_eer)
                 if val_eer is not None:
                     if self.config.get('use_video', False) and self.lambda_modal_align > 0:
                         print(
@@ -1021,14 +1059,26 @@ class Trainer:
                 # 保存最佳模型
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    self.save_checkpoint(epoch, is_best=True, best_val_loss=best_val_loss)
+                    if val_eer is not None:
+                        best_val_eer = val_eer
+                    self.save_checkpoint(
+                        epoch,
+                        is_best=True,
+                        best_val_loss=best_val_loss,
+                        best_val_eer=best_val_eer
+                    )
                     print(f"保存最佳模型 (验证损失: {val_loss:.4f})")
             elif val_loader is not None:
                 print(f"跳过本轮验证（val_interval={val_interval}）")
             
             # 定期保存检查点（每个save_interval epoch）
             if (epoch + 1) % save_interval == 0:
-                self.save_checkpoint(epoch, is_best=False, best_val_loss=best_val_loss)
+                self.save_checkpoint(
+                    epoch,
+                    is_best=False,
+                    best_val_loss=best_val_loss,
+                    best_val_eer=best_val_eer
+                )
             
             # 更新学习率
             if isinstance(self.scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
@@ -1040,10 +1090,27 @@ class Trainer:
             self._maybe_release_memory()
         
         # 训练结束前保存最后一次checkpoint
-        self.save_checkpoint(num_epochs - 1, is_best=False, best_val_loss=best_val_loss)
+        self.save_checkpoint(
+            num_epochs - 1,
+            is_best=False,
+            best_val_loss=best_val_loss,
+            best_val_eer=best_val_eer
+        )
         print("\n训练完成！")
+        summary = {
+            'start_epoch': start_epoch,
+            'num_epochs': num_epochs,
+            'final_epoch': num_epochs - 1,
+            'best_val_loss': None if best_val_loss == float('inf') else float(best_val_loss),
+            'best_val_eer': None if best_val_eer is None else float(best_val_eer),
+            'last_train_loss': float(self.train_history['loss'][-1]) if self.train_history['loss'] else None,
+            'last_val_loss': None if last_val_loss is None else float(last_val_loss),
+            'last_val_eer': None if last_val_eer is None else float(last_val_eer),
+            'checkpoint_dir': self.config.get('checkpoint_dir', 'checkpoints'),
+        }
+        return summary
     
-    def save_checkpoint(self, epoch, is_best=False, best_val_loss=float('inf')):
+    def save_checkpoint(self, epoch, is_best=False, best_val_loss=float('inf'), best_val_eer=None):
         """
         保存检查点
         
@@ -1051,6 +1118,7 @@ class Trainer:
             epoch: 当前epoch
             is_best: 是否为最佳模型
             best_val_loss: 最佳验证损失
+            best_val_eer: 最佳验证EER
         """
         checkpoint_dir = self.config.get('checkpoint_dir', 'checkpoints')
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1063,7 +1131,8 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'train_history': self.train_history,
             'config': self.config,
-            'best_val_loss': best_val_loss
+            'best_val_loss': best_val_loss,
+            'best_val_eer': best_val_eer,
         }
         
         # 保存最新检查点（每次保存都更新latest_checkpoint）
@@ -1108,9 +1177,24 @@ class Trainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.train_history = checkpoint.get(
             'train_history',
-            {'loss': [], 'am_loss': [], 'intra_loss': [], 'modal_align_loss': []}
+            {
+                'loss': [],
+                'am_loss': [],
+                'intra_loss': [],
+                'modal_align_loss': [],
+                'val_loss': [],
+                'val_am_loss': [],
+                'val_intra_loss': [],
+                'val_modal_align_loss': [],
+                'val_eer': [],
+            }
         )
         self.train_history.setdefault('modal_align_loss', [])
+        self.train_history.setdefault('val_loss', [])
+        self.train_history.setdefault('val_am_loss', [])
+        self.train_history.setdefault('val_intra_loss', [])
+        self.train_history.setdefault('val_modal_align_loss', [])
+        self.train_history.setdefault('val_eer', [])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"加载检查点: {checkpoint_path} (Epoch {checkpoint['epoch']})")

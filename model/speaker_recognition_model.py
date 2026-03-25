@@ -305,6 +305,9 @@ class SpeakerRecognitionModel(nn.Module):
         max_attention_frames=0,
         temporal_pool_type='avg',
         use_attention_checkpoint=False,
+        enable_local_attention=True,
+        enable_global_attention=True,
+        enable_channel_attention=True,
         use_video=False,
         video_in_channels=3,
         video_channels=24,
@@ -355,6 +358,9 @@ class SpeakerRecognitionModel(nn.Module):
             num_heads=num_heads,
             reduction=16,
             dropout=dropout,
+            enable_local_attention=enable_local_attention,
+            enable_global_attention=enable_global_attention,
+            enable_channel_attention=enable_channel_attention,
         )
 
         # 4. 特征拼接与融合（在注意力融合后）
