@@ -1,0 +1,67 @@
+{
+  "base_config": "config.json",
+  "seed": 42,
+  "global_overrides": {},
+  "experiments": [
+    {
+      "name": "full",
+      "overrides": {}
+    },
+    {
+      "name": "no_intra",
+      "overrides": {
+        "loss": {
+          "lambda_intra": 0.0
+        }
+      }
+    },
+    {
+      "name": "no_modal_align",
+      "overrides": {
+        "training": {
+          "lambda_modal_align": 0.0
+        }
+      }
+    },
+    {
+      "name": "no_warmup_freeze",
+      "overrides": {
+        "training": {
+          "freeze_audio_warmup_epochs": 0
+        }
+      }
+    },
+    {
+      "name": "no_modality_dropout",
+      "overrides": {
+        "model": {
+          "modality_dropout": 0.0
+        }
+      }
+    },
+    {
+      "name": "no_local_attention",
+      "overrides": {
+        "model": {
+          "enable_local_attention": false
+        }
+      }
+    },
+    {
+      "name": "no_global_attention",
+      "overrides": {
+        "model": {
+          "enable_global_attention": false
+        }
+      }
+    },
+    {
+      "name": "no_channel_attention",
+      "overrides": {
+        "model": {
+          "enable_channel_attention": false
+        }
+      }
+    }
+  ]
+}
