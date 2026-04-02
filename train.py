@@ -94,6 +94,12 @@ class Trainer:
             max_attention_frames=config.get('max_attention_frames', 0),
             temporal_pool_type=config.get('temporal_pool_type', 'avg'),
             use_attention_checkpoint=config.get('use_attention_checkpoint', False),
+            use_frequency_transform=config.get('use_frequency_transform', True),
+            freq_n_fft=config.get('freq_n_fft', 512),
+            freq_hop_length=config.get('freq_hop_length', 160),
+            freq_win_length=config.get('freq_win_length', 400),
+            freq_projection_channels=config.get('freq_projection_channels', 64),
+            freq_fusion_scale=config.get('freq_fusion_scale', 0.4),
             enable_local_attention=config.get('enable_local_attention', True),
             enable_global_attention=config.get('enable_global_attention', True),
             enable_channel_attention=config.get('enable_channel_attention', True),
@@ -944,8 +950,21 @@ class Trainer:
             else:
                 print("警告: 检查点不包含 criterion_state_dict，ArcFace 分类头将使用当前初始化权重")
 
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            optimizer_loaded = False
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    optimizer_loaded = True
+                except ValueError as e:
+                    print(f"警告: 优化器状态与当前模型不兼容，已跳过恢复: {e}")
+            if 'scheduler_state_dict' in checkpoint:
+                if optimizer_loaded:
+                    try:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    except ValueError as e:
+                        print(f"警告: 学习率调度器状态恢复失败，使用当前配置重置: {e}")
+                else:
+                    print("提示: 由于优化器状态未恢复，学习率调度器将使用当前配置重新初始化")
             self.train_history = checkpoint.get(
                 'train_history',
                 {
@@ -1173,8 +1192,21 @@ class Trainer:
         else:
             print("警告: 检查点不包含 criterion_state_dict，ArcFace 分类头将使用当前初始化权重")
 
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        optimizer_loaded = False
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                optimizer_loaded = True
+            except ValueError as e:
+                print(f"警告: 优化器状态与当前模型不兼容，已跳过恢复: {e}")
+        if 'scheduler_state_dict' in checkpoint:
+            if optimizer_loaded:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except ValueError as e:
+                    print(f"警告: 学习率调度器状态恢复失败，使用当前配置重置: {e}")
+            else:
+                print("提示: 由于优化器状态未恢复，学习率调度器将使用当前配置重新初始化")
         self.train_history = checkpoint.get(
             'train_history',
             {

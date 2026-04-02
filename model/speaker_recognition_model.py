@@ -305,6 +305,12 @@ class SpeakerRecognitionModel(nn.Module):
         max_attention_frames=0,
         temporal_pool_type='avg',
         use_attention_checkpoint=False,
+        use_frequency_transform=True,
+        freq_n_fft=512,
+        freq_hop_length=160,
+        freq_win_length=400,
+        freq_projection_channels=64,
+        freq_fusion_scale=0.4,
         enable_local_attention=True,
         enable_global_attention=True,
         enable_channel_attention=True,
@@ -340,6 +346,12 @@ class SpeakerRecognitionModel(nn.Module):
         self.multi_scale_frontend = MultiScaleFeatureExtraction(
             in_channels=in_channels,
             out_channels=frontend_channels,
+            use_frequency_transform=use_frequency_transform,
+            freq_n_fft=freq_n_fft,
+            freq_hop_length=freq_hop_length,
+            freq_win_length=freq_win_length,
+            freq_projection_channels=freq_projection_channels,
+            freq_fusion_scale=freq_fusion_scale,
         )
 
         # 2. 额外的卷积层用于特征提取

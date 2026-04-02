@@ -345,7 +345,13 @@ def main(config_path='config.json', disable_auto_resume=False):
                 'embedding_dim': 256,
                 'num_classes': 100,
                 'num_heads': 8,
-                'dropout': 0.1
+                'dropout': 0.1,
+                'use_frequency_transform': True,
+                'freq_n_fft': 512,
+                'freq_hop_length': 160,
+                'freq_win_length': 400,
+                'freq_projection_channels': 64,
+                'freq_fusion_scale': 0.4,
             },
             'loss': {
                 'am_margin': 0.3,
@@ -435,6 +441,12 @@ def main(config_path='config.json', disable_auto_resume=False):
         'enable_local_attention': True,
         'enable_global_attention': True,
         'enable_channel_attention': True,
+        'use_frequency_transform': True,
+        'freq_n_fft': 512,
+        'freq_hop_length': 160,
+        'freq_win_length': 400,
+        'freq_projection_channels': 64,
+        'freq_fusion_scale': 0.4,
     }
     for k, v in defaults.items():
         config.setdefault(k, v)

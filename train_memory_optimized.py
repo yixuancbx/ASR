@@ -34,7 +34,13 @@ class MemoryOptimizedTrainer:
             embedding_dim=config['embedding_dim'],
             num_classes=config['num_classes'],
             num_heads=config['num_heads'],
-            dropout=config['dropout']
+            dropout=config['dropout'],
+            use_frequency_transform=config.get('use_frequency_transform', True),
+            freq_n_fft=config.get('freq_n_fft', 512),
+            freq_hop_length=config.get('freq_hop_length', 160),
+            freq_win_length=config.get('freq_win_length', 400),
+            freq_projection_channels=config.get('freq_projection_channels', 64),
+            freq_fusion_scale=config.get('freq_fusion_scale', 0.4),
         ).to(self.device)
         
         # 计算模型大小

@@ -228,6 +228,20 @@ class SpeakerIdentifier:
             raise ValueError("checkpoint 格式错误，期望是包含 model_state_dict/config 的字典")
 
         self.config = checkpoint.get("config", {})
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        if isinstance(state_dict, dict) and state_dict:
+            first_key = next(iter(state_dict.keys()))
+            if first_key.startswith("module."):
+                state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        else:
+            state_dict = {}
+
+        has_frequency_branch = any(
+            key.startswith("multi_scale_frontend.frequency_transform.")
+            for key in state_dict.keys()
+        )
+        use_frequency_transform = self.config.get("use_frequency_transform", has_frequency_branch)
+
         self.model = SpeakerRecognitionModel(
             in_channels=self.config.get("in_channels", 1),
             frontend_channels=self.config.get("frontend_channels", 64),
@@ -240,6 +254,12 @@ class SpeakerIdentifier:
             max_attention_frames=self.config.get("max_attention_frames", 0),
             temporal_pool_type=self.config.get("temporal_pool_type", "avg"),
             use_attention_checkpoint=self.config.get("use_attention_checkpoint", False),
+            use_frequency_transform=use_frequency_transform,
+            freq_n_fft=self.config.get("freq_n_fft", 512),
+            freq_hop_length=self.config.get("freq_hop_length", 160),
+            freq_win_length=self.config.get("freq_win_length", 400),
+            freq_projection_channels=self.config.get("freq_projection_channels", 64),
+            freq_fusion_scale=self.config.get("freq_fusion_scale", 0.4),
             use_video=self.config.get("use_video", False),
             video_in_channels=self.config.get("video_in_channels", 3),
             video_channels=self.config.get("video_channels", 32),
@@ -248,12 +268,6 @@ class SpeakerIdentifier:
             modality_dropout=self.config.get("modality_dropout", 0.0),
             fusion_num_heads=self.config.get("fusion_num_heads", 4),
         ).to(self.device)
-
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
-        if isinstance(state_dict, dict) and state_dict:
-            first_key = next(iter(state_dict.keys()))
-            if first_key.startswith("module."):
-                state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing:
