@@ -296,7 +296,7 @@ class SpeakerRecognitionModel(nn.Module):
         self,
         in_channels=1,
         frontend_channels=64,
-        attention_channels=192,  # 3 * frontend_channels
+        attention_channels=192,  # 默认值，最终按前端输出通道自动校准
         embedding_dim=256,
         num_classes=100,
         num_heads=8,
@@ -306,6 +306,7 @@ class SpeakerRecognitionModel(nn.Module):
         temporal_pool_type='avg',
         use_attention_checkpoint=False,
         use_frequency_transform=True,
+        freq_integration_mode='parallel',
         freq_n_fft=512,
         freq_hop_length=160,
         freq_win_length=400,
@@ -326,14 +327,6 @@ class SpeakerRecognitionModel(nn.Module):
         self.use_video = use_video
         self.embedding_dim = embedding_dim
 
-        expected_attention_channels = frontend_channels * 3
-        if attention_channels != expected_attention_channels:
-            print(
-                f"警告: attention_channels={attention_channels} 与 3*frontend_channels={expected_attention_channels} 不一致，"
-                "已自动调整为匹配值"
-            )
-            attention_channels = expected_attention_channels
-
         self.temporal_pool_stride = max(1, int(temporal_pool_stride))
         self.max_attention_frames = max(0, int(max_attention_frames))
         self.temporal_pool_type = str(temporal_pool_type).lower()
@@ -347,12 +340,28 @@ class SpeakerRecognitionModel(nn.Module):
             in_channels=in_channels,
             out_channels=frontend_channels,
             use_frequency_transform=use_frequency_transform,
+            freq_integration_mode=freq_integration_mode,
             freq_n_fft=freq_n_fft,
             freq_hop_length=freq_hop_length,
             freq_win_length=freq_win_length,
             freq_projection_channels=freq_projection_channels,
             freq_fusion_scale=freq_fusion_scale,
         )
+        expected_attention_channels = self.multi_scale_frontend.output_channels
+        if attention_channels != expected_attention_channels:
+            print(
+                f"警告: attention_channels={attention_channels} 与前端输出通道={expected_attention_channels} 不一致，"
+                "已自动调整为匹配值"
+            )
+            attention_channels = expected_attention_channels
+        resolved_num_heads = max(1, int(num_heads))
+        while resolved_num_heads > 1 and attention_channels % resolved_num_heads != 0:
+            resolved_num_heads -= 1
+        if resolved_num_heads != num_heads:
+            print(
+                f"警告: num_heads={num_heads} 与 attention_channels={attention_channels} 不整除，"
+                f"已自动调整为 {resolved_num_heads}"
+            )
 
         # 2. 额外的卷积层用于特征提取
         self.conv_layers = nn.Sequential(
@@ -367,7 +376,7 @@ class SpeakerRecognitionModel(nn.Module):
         # 3. 多层次动态注意力融合模块
         self.attention_fusion = MultiLevelDynamicAttentionFusion(
             in_channels=attention_channels,
-            num_heads=num_heads,
+            num_heads=resolved_num_heads,
             reduction=16,
             dropout=dropout,
             enable_local_attention=enable_local_attention,

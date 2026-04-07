@@ -36,6 +36,7 @@ class MemoryOptimizedTrainer:
             num_heads=config['num_heads'],
             dropout=config['dropout'],
             use_frequency_transform=config.get('use_frequency_transform', True),
+            freq_integration_mode=config.get('freq_integration_mode', 'parallel'),
             freq_n_fft=config.get('freq_n_fft', 512),
             freq_hop_length=config.get('freq_hop_length', 160),
             freq_win_length=config.get('freq_win_length', 400),

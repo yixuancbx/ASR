@@ -2,7 +2,7 @@
   "model": {
     "in_channels": 1,
     "frontend_channels": 128,
-    "attention_channels": 384,
+    "attention_channels": 448,
     "embedding_dim": 256,
     "num_classes": 100,
     "num_heads": 8,
@@ -12,6 +12,7 @@
     "temporal_pool_type": "avg",
     "use_attention_checkpoint": true,
     "use_frequency_transform": true,
+    "freq_integration_mode": "parallel",
     "freq_n_fft": 512,
     "freq_hop_length": 160,
     "freq_win_length": 400,

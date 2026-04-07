@@ -1,6 +1,6 @@
 """
 多尺度特征提取前端
-包含三个并行分支：小卷积核、大卷积核、深度可分离卷积
+包含三个时域并行分支，可选频域并行分支。
 """
 import torch
 import torch.nn as nn
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 class FrequencyDomainTransform(nn.Module):
-    """将时域波形转换为与原序列等长的频域描述。"""
+    """将时域波形转换为与原序列等长的频域时序特征。"""
 
     def __init__(
         self,
@@ -16,6 +16,7 @@ class FrequencyDomainTransform(nn.Module):
         hop_length=160,
         win_length=400,
         projection_channels=64,
+        output_channels=1,
         eps=1e-6,
     ):
         super().__init__()
@@ -26,14 +27,15 @@ class FrequencyDomainTransform(nn.Module):
             self.win_length = self.n_fft
         self.freq_bins = self.n_fft // 2 + 1
         hidden_channels = max(16, int(projection_channels))
+        self.output_channels = max(1, int(output_channels))
         self.eps = float(eps)
         self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
-        # 用可学习投影替代简单频率均值，保留更丰富的频域判别信息。
+        # 用可学习投影提取频域特征，支持多通道输出。
         self.spectral_projector = nn.Sequential(
             nn.Conv1d(self.freq_bins * 2, hidden_channels, kernel_size=1, bias=False),
             nn.BatchNorm1d(hidden_channels),
             nn.SiLU(inplace=True),
-            nn.Conv1d(hidden_channels, 1, kernel_size=1, bias=True),
+            nn.Conv1d(hidden_channels, self.output_channels, kernel_size=1, bias=True),
         )
 
     def _resolve_window(self, device, dtype):
@@ -49,7 +51,7 @@ class FrequencyDomainTransform(nn.Module):
         Args:
             x: [B, C, T] 输入波形（通常 C=1）
         Returns:
-            [B, 1, T] 归一化频域包络
+            [B, C_f, T] 归一化频域特征
         """
         if x.dim() != 3:
             raise ValueError("FrequencyDomainTransform 输入应为 [B, C, T]")
@@ -81,19 +83,19 @@ class FrequencyDomainTransform(nn.Module):
         projector_dtype = self.spectral_projector[0].weight.dtype
         if spectral_features.dtype != projector_dtype:
             spectral_features = spectral_features.to(dtype=projector_dtype)
-        spectral_envelope = self.spectral_projector(spectral_features)  # [B, 1, N]
-        spectral_envelope = F.interpolate(
-            spectral_envelope,
+        spectral_embedding = self.spectral_projector(spectral_features)  # [B, C_f, N]
+        spectral_embedding = F.interpolate(
+            spectral_embedding,
             size=x.size(-1),
             mode='linear',
             align_corners=False
-        )  # [B, 1, T]
+        )  # [B, C_f, T]
 
-        # 每条样本做标准化，稳定不同录音条件下的动态范围。
-        spectral_envelope = spectral_envelope - spectral_envelope.mean(dim=-1, keepdim=True)
-        spectral_std = spectral_envelope.std(dim=-1, keepdim=True).clamp_min(self.eps)
-        spectral_envelope = spectral_envelope / spectral_std
-        return spectral_envelope.to(dtype=orig_dtype)
+        # 每条样本的每个通道做标准化，稳定不同录音条件下的动态范围。
+        spectral_embedding = spectral_embedding - spectral_embedding.mean(dim=-1, keepdim=True)
+        spectral_std = spectral_embedding.std(dim=-1, keepdim=True).clamp_min(self.eps)
+        spectral_embedding = spectral_embedding / spectral_std
+        return spectral_embedding.to(dtype=orig_dtype)
 
 
 class TimeFrequencyFusion(nn.Module):
@@ -114,6 +116,41 @@ class TimeFrequencyFusion(nn.Module):
             raise ValueError("TimeFrequencyFusion 需要时域与频域特征形状一致")
         gate = self.gate(torch.cat([time_signal, freq_signal], dim=1))
         return time_signal + self.freq_fusion_scale * gate * freq_signal
+
+
+class FrequencyParallelBranch(nn.Module):
+    """频域并行分支：提取频域特征并做局部时序建模。"""
+
+    def __init__(
+        self,
+        out_channels=64,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        projection_channels=64,
+    ):
+        super().__init__()
+        self.out_channels = max(1, int(out_channels))
+        projector_hidden = max(int(projection_channels), self.out_channels)
+        self.frequency_transform = FrequencyDomainTransform(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            projection_channels=projector_hidden,
+            output_channels=self.out_channels,
+        )
+        self.refine = nn.Sequential(
+            nn.Conv1d(self.out_channels, self.out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(self.out_channels),
+            nn.ReLU(),
+            nn.Conv1d(self.out_channels, self.out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(self.out_channels),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        freq_features = self.frequency_transform(x)  # [B, C_f, T]
+        return self.refine(freq_features)
 
 
 class SmallKernelBranch(nn.Module):
@@ -177,6 +214,7 @@ class MultiScaleFeatureExtraction(nn.Module):
         in_channels=1,
         out_channels=64,
         use_frequency_transform=True,
+        freq_integration_mode='parallel',
         freq_n_fft=512,
         freq_hop_length=160,
         freq_win_length=400,
@@ -185,40 +223,67 @@ class MultiScaleFeatureExtraction(nn.Module):
     ):
         super(MultiScaleFeatureExtraction, self).__init__()
         self.use_frequency_transform = bool(use_frequency_transform)
+        self.freq_branch_channels = max(1, int(freq_projection_channels))
+        self.freq_integration_mode = str(freq_integration_mode).lower()
+        if self.freq_integration_mode not in {'parallel', 'gated'}:
+            print(
+                f"警告: freq_integration_mode={freq_integration_mode} 无效，"
+                "已回退到 parallel"
+            )
+            self.freq_integration_mode = 'parallel'
 
         if self.use_frequency_transform:
-            self.frequency_transform = FrequencyDomainTransform(
-                n_fft=freq_n_fft,
-                hop_length=freq_hop_length,
-                win_length=freq_win_length,
-                projection_channels=freq_projection_channels,
-            )
-            self.time_frequency_fusion = TimeFrequencyFusion(
-                freq_fusion_scale=freq_fusion_scale
-            )
+            if self.freq_integration_mode == 'gated':
+                self.frequency_transform = FrequencyDomainTransform(
+                    n_fft=freq_n_fft,
+                    hop_length=freq_hop_length,
+                    win_length=freq_win_length,
+                    projection_channels=freq_projection_channels,
+                    output_channels=1,
+                )
+                self.time_frequency_fusion = TimeFrequencyFusion(
+                    freq_fusion_scale=freq_fusion_scale
+                )
+            else:
+                self.frequency_branch = FrequencyParallelBranch(
+                    out_channels=self.freq_branch_channels,
+                    n_fft=freq_n_fft,
+                    hop_length=freq_hop_length,
+                    win_length=freq_win_length,
+                    projection_channels=freq_projection_channels,
+                )
 
-        # 三个并行分支
+        # 三个时域并行分支
         self.branch1 = SmallKernelBranch(in_channels, out_channels, kernel_size=3)
         self.branch2 = LargeKernelBranch(in_channels, out_channels, kernel_size=15)
         self.branch3 = DepthwiseSeparableBranch(in_channels, out_channels, kernel_size=7)
+        self.output_channels = out_channels * 3
+        if self.use_frequency_transform and self.freq_integration_mode == 'parallel':
+            self.output_channels += self.freq_branch_channels
         
     def forward(self, x):
         """
         Args:
             x: [B, 1, T] 输入语音波形
         Returns:
-            features: [B, 3*C, T] 三个分支的特征拼接
+            features: [B, C_out, T] 多分支特征拼接
         """
-        if self.use_frequency_transform:
+        time_input = x
+        if self.use_frequency_transform and self.freq_integration_mode == 'gated':
             freq_features = self.frequency_transform(x)  # [B, 1, T]
-            x = self.time_frequency_fusion(x, freq_features)
+            time_input = self.time_frequency_fusion(x, freq_features)
 
-        feat1 = self.branch1(x)  # [B, C, T]
-        feat2 = self.branch2(x)  # [B, C, T]
-        feat3 = self.branch3(x)  # [B, C, T]
-        
-        # 拼接三个分支的特征
-        features = torch.cat([feat1, feat2, feat3], dim=1)  # [B, 3*C, T]
+        feat1 = self.branch1(time_input)  # [B, C, T]
+        feat2 = self.branch2(time_input)  # [B, C, T]
+        feat3 = self.branch3(time_input)  # [B, C, T]
+
+        features = [feat1, feat2, feat3]
+        if self.use_frequency_transform and self.freq_integration_mode == 'parallel':
+            freq_branch_features = self.frequency_branch(x)  # [B, C_f, T]
+            features.append(freq_branch_features)
+
+        # 拼接多分支特征
+        features = torch.cat(features, dim=1)
         return features
 
 

@@ -236,16 +236,40 @@ class SpeakerIdentifier:
         else:
             state_dict = {}
 
-        has_frequency_branch = any(
+        has_gated_frequency_branch = any(
             key.startswith("multi_scale_frontend.frequency_transform.")
             for key in state_dict.keys()
         )
-        use_frequency_transform = self.config.get("use_frequency_transform", has_frequency_branch)
+        has_parallel_frequency_branch = any(
+            key.startswith("multi_scale_frontend.frequency_branch.")
+            for key in state_dict.keys()
+        )
+        has_time_frequency_fusion = any(
+            key.startswith("multi_scale_frontend.time_frequency_fusion.")
+            for key in state_dict.keys()
+        )
+        has_any_frequency_branch = has_gated_frequency_branch or has_parallel_frequency_branch
+        use_frequency_transform = self.config.get("use_frequency_transform", has_any_frequency_branch)
+        freq_integration_mode = self.config.get("freq_integration_mode")
+        if freq_integration_mode is None:
+            # 兼容旧 checkpoint：包含门控融合参数时优先按 gated 处理。
+            if has_time_frequency_fusion or (has_gated_frequency_branch and not has_parallel_frequency_branch):
+                freq_integration_mode = "gated"
+            else:
+                freq_integration_mode = "parallel"
+        frontend_channels = self.config.get("frontend_channels", 64)
+        configured_attention_channels = self.config.get("attention_channels", None)
+        if configured_attention_channels is not None:
+            attention_channels = configured_attention_channels
+        elif use_frequency_transform and freq_integration_mode == "parallel":
+            attention_channels = frontend_channels * 3 + self.config.get("freq_projection_channels", 64)
+        else:
+            attention_channels = frontend_channels * 3
 
         self.model = SpeakerRecognitionModel(
             in_channels=self.config.get("in_channels", 1),
-            frontend_channels=self.config.get("frontend_channels", 64),
-            attention_channels=self.config.get("attention_channels", self.config.get("frontend_channels", 64) * 3),
+            frontend_channels=frontend_channels,
+            attention_channels=attention_channels,
             embedding_dim=self.config.get("embedding_dim", 256),
             num_classes=self.config.get("num_classes", 100),
             num_heads=self.config.get("num_heads", 8),
@@ -255,6 +279,7 @@ class SpeakerIdentifier:
             temporal_pool_type=self.config.get("temporal_pool_type", "avg"),
             use_attention_checkpoint=self.config.get("use_attention_checkpoint", False),
             use_frequency_transform=use_frequency_transform,
+            freq_integration_mode=freq_integration_mode,
             freq_n_fft=self.config.get("freq_n_fft", 512),
             freq_hop_length=self.config.get("freq_hop_length", 160),
             freq_win_length=self.config.get("freq_win_length", 400),

@@ -95,6 +95,7 @@ class Trainer:
             temporal_pool_type=config.get('temporal_pool_type', 'avg'),
             use_attention_checkpoint=config.get('use_attention_checkpoint', False),
             use_frequency_transform=config.get('use_frequency_transform', True),
+            freq_integration_mode=config.get('freq_integration_mode', 'parallel'),
             freq_n_fft=config.get('freq_n_fft', 512),
             freq_hop_length=config.get('freq_hop_length', 160),
             freq_win_length=config.get('freq_win_length', 400),
@@ -1558,7 +1559,7 @@ if __name__ == '__main__':
     config = {
         'in_channels': 1,
         'frontend_channels': 64,
-        'attention_channels': 192,  # 3 * frontend_channels
+        'attention_channels': 256,  # 3 * frontend_channels + freq_projection_channels
         'embedding_dim': 256,
         'num_classes': 100,
         'num_heads': 8,

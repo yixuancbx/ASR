@@ -12,7 +12,7 @@ def test_model():
     model = SpeakerRecognitionModel(
         in_channels=1,
         frontend_channels=64,
-        attention_channels=192,
+        attention_channels=256,
         embedding_dim=256,
         num_classes=100,
         num_heads=8,
