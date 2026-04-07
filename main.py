@@ -562,6 +562,23 @@ def main(config_path='config.json', disable_auto_resume=False):
             loader_kwargs['decode_window_seconds'] = data_config.get('video_decode_window_sec', None)
             loader_kwargs['worker_trim_interval'] = data_config.get('worker_trim_interval', 256)
             loader_kwargs['video_return_float16'] = data_config.get('video_return_float16', True)
+            loader_kwargs['use_musan_noise'] = data_config.get('use_musan_noise', False)
+            loader_kwargs['musan_root'] = data_config.get('musan_root', None)
+            loader_kwargs['musan_apply_prob'] = data_config.get('musan_apply_prob', 0.7)
+            loader_kwargs['musan_snr_min_db'] = data_config.get('musan_snr_min_db', 5.0)
+            loader_kwargs['musan_snr_max_db'] = data_config.get('musan_snr_max_db', 20.0)
+            loader_kwargs['musan_noise_weight'] = data_config.get('musan_noise_weight', 0.5)
+            loader_kwargs['musan_speech_weight'] = data_config.get('musan_speech_weight', 0.25)
+            loader_kwargs['musan_music_weight'] = data_config.get('musan_music_weight', 0.25)
+            loader_kwargs['disable_audio_time_aug_for_avsync'] = data_config.get(
+                'disable_audio_time_aug_for_avsync',
+                True
+            )
+            loader_kwargs['use_face_roi'] = data_config.get('use_face_roi', True)
+            loader_kwargs['face_roi_expand_ratio'] = data_config.get('face_roi_expand_ratio', 1.35)
+            loader_kwargs['face_roi_smooth_alpha'] = data_config.get('face_roi_smooth_alpha', 0.75)
+            loader_kwargs['face_roi_score_thr'] = data_config.get('face_roi_score_thr', 0.8)
+            loader_kwargs['face_roi_min_size'] = data_config.get('face_roi_min_size', 24)
 
             raw_workers = loader_kwargs.get('num_workers', 0)
             try:
